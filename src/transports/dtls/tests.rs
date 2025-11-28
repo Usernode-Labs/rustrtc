@@ -4,29 +4,18 @@ use crate::transports::ice::IceSocketWrapper;
 use bytes::Bytes;
 use std::sync::Arc;
 use tokio::net::UdpSocket;
-use tokio::sync::RwLock;
+use tokio::sync::watch;
 
 #[tokio::test]
 async fn test_dtls_handshake_client_hello() -> Result<()> {
-    let client_socket = UdpSocket::bind("127.0.0.1:0").await?;
-    let server_socket = UdpSocket::bind("127.0.0.1:0").await?;
+    let client_socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await?);
+    let server_socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await?);
 
     let client_addr = client_socket.local_addr()?;
     let server_addr = server_socket.local_addr()?;
 
-    let client_conn = Arc::new(IceConn {
-        socket: IceSocketWrapper::Udp(Arc::new(client_socket)),
-        remote_addr: RwLock::new(server_addr),
-        dtls_receiver: RwLock::new(None),
-        rtp_receiver: RwLock::new(None),
-    });
-
-    let server_conn = Arc::new(IceConn {
-        socket: IceSocketWrapper::Udp(Arc::new(server_socket)),
-        remote_addr: RwLock::new(client_addr),
-        dtls_receiver: RwLock::new(None),
-        rtp_receiver: RwLock::new(None),
-    });
+    let (client_socket_tx, _) = watch::channel(Some(IceSocketWrapper::Udp(client_socket.clone())));
+    let client_conn = IceConn::new(client_socket_tx.subscribe(), server_addr);
 
     let cert = generate_certificate()?;
 
@@ -35,7 +24,7 @@ async fn test_dtls_handshake_client_hello() -> Result<()> {
 
     // Read from server socket to verify ClientHello
     let mut buf = vec![0u8; 2048];
-    let (len, addr) = server_conn.socket.recv_from(&mut buf).await?;
+    let (len, addr) = server_socket.recv_from(&mut buf).await?;
     assert_eq!(addr, client_addr);
 
     let mut data = Bytes::copy_from_slice(&buf[..len]);
@@ -53,18 +42,14 @@ async fn test_dtls_handshake_client_hello() -> Result<()> {
 
 #[tokio::test]
 async fn test_dtls_handshake_server_hello() -> Result<()> {
-    let client_socket = UdpSocket::bind("127.0.0.1:0").await?;
-    let server_socket = UdpSocket::bind("127.0.0.1:0").await?;
+    let client_socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await?);
+    let server_socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await?);
 
     let client_addr = client_socket.local_addr()?;
     let server_addr = server_socket.local_addr()?;
 
-    let server_conn = Arc::new(IceConn {
-        socket: IceSocketWrapper::Udp(Arc::new(server_socket)),
-        remote_addr: RwLock::new(client_addr),
-        dtls_receiver: RwLock::new(None),
-        rtp_receiver: RwLock::new(None),
-    });
+    let (server_socket_tx, _) = watch::channel(Some(IceSocketWrapper::Udp(server_socket.clone())));
+    let server_conn = IceConn::new(server_socket_tx.subscribe(), client_addr);
 
     let cert = generate_certificate()?;
 
@@ -72,7 +57,7 @@ async fn test_dtls_handshake_server_hello() -> Result<()> {
     let _server_dtls = DtlsTransport::new(server_conn.clone(), cert.clone(), false).await?;
 
     // Start a loop to feed server_dtls
-    let server_socket_clone = server_conn.socket.clone();
+    let server_socket_clone = server_socket.clone();
     let server_conn_clone = server_conn.clone();
     tokio::spawn(async move {
         let mut buf = vec![0u8; 2048];
@@ -187,34 +172,26 @@ async fn test_dtls_handshake_server_hello() -> Result<()> {
 
 #[tokio::test]
 async fn test_dtls_handshake_full_flow() -> Result<()> {
-    let client_socket = UdpSocket::bind("127.0.0.1:0").await?;
-    let server_socket = UdpSocket::bind("127.0.0.1:0").await?;
+    let client_socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await?);
+    let server_socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await?);
 
     let client_addr = client_socket.local_addr()?;
     let server_addr = server_socket.local_addr()?;
 
-    let client_conn = Arc::new(IceConn {
-        socket: IceSocketWrapper::Udp(Arc::new(client_socket)),
-        remote_addr: RwLock::new(server_addr),
-        dtls_receiver: RwLock::new(None),
-        rtp_receiver: RwLock::new(None),
-    });
+    let (client_socket_tx, _) = watch::channel(Some(IceSocketWrapper::Udp(client_socket.clone())));
+    let client_conn = IceConn::new(client_socket_tx.subscribe(), server_addr);
 
-    let server_conn = Arc::new(IceConn {
-        socket: IceSocketWrapper::Udp(Arc::new(server_socket)),
-        remote_addr: RwLock::new(client_addr),
-        dtls_receiver: RwLock::new(None),
-        rtp_receiver: RwLock::new(None),
-    });
+    let (server_socket_tx, _) = watch::channel(Some(IceSocketWrapper::Udp(server_socket.clone())));
+    let server_conn = IceConn::new(server_socket_tx.subscribe(), client_addr);
 
     let cert = generate_certificate()?;
 
-    // Start client and server
+    // Start client
     let _client_dtls = DtlsTransport::new(client_conn.clone(), cert.clone(), true).await?;
     let _server_dtls = DtlsTransport::new(server_conn.clone(), cert.clone(), false).await?;
 
     // Start loops to feed DTLS transports
-    let client_socket_clone = client_conn.socket.clone();
+    let client_socket_clone = client_socket.clone();
     let client_conn_clone = client_conn.clone();
     tokio::spawn(async move {
         let mut buf = vec![0u8; 2048];
@@ -226,7 +203,7 @@ async fn test_dtls_handshake_full_flow() -> Result<()> {
         }
     });
 
-    let server_socket_clone = server_conn.socket.clone();
+    let server_socket_clone = server_socket.clone();
     let server_conn_clone = server_conn.clone();
     tokio::spawn(async move {
         let mut buf = vec![0u8; 2048];

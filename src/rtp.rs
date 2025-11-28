@@ -1,8 +1,10 @@
 use crate::errors::{RtpError, RtpResult};
+use serde::{Deserialize, Serialize};
 
 const RTP_VERSION: u8 = 2;
 pub const RTCP_SR: u8 = 200;
 pub const RTCP_RR: u8 = 201;
+pub const RTCP_SDES: u8 = 202;
 pub const RTCP_RTPFB: u8 = 205;
 pub const RTCP_PSFB: u8 = 206;
 
@@ -13,7 +15,7 @@ pub const RTCP_PSFB_PLI: u8 = 1;
 pub const RTCP_PSFB_FIR: u8 = 4;
 pub const RTCP_PSFB_APP: u8 = 15; // REMB lives under APP-format payload feedback
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RtpHeaderExtension {
     pub profile: u16,
     pub data: Vec<u8>,
@@ -275,9 +277,27 @@ pub struct TransportWideCc {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SdesItem {
+    pub ty: u8,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SdesChunk {
+    pub ssrc: u32,
+    pub items: Vec<SdesItem>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceDescription {
+    pub chunks: Vec<SdesChunk>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RtcpPacket {
     SenderReport(SenderReport),
     ReceiverReport(ReceiverReport),
+    SourceDescription(SourceDescription),
     PictureLossIndication(PictureLossIndication),
     FullIntraRequest(FullIntraRequest),
     GenericNack(GenericNack),
@@ -315,6 +335,7 @@ pub fn parse_rtcp_packets(raw: &[u8]) -> RtpResult<Vec<RtcpPacket>> {
         let packet = match packet_type {
             RTCP_SR => RtcpPacket::SenderReport(parse_sender_report(fmt, body)?),
             RTCP_RR => RtcpPacket::ReceiverReport(parse_receiver_report(fmt, body)?),
+            RTCP_SDES => RtcpPacket::SourceDescription(parse_sdes(fmt, body)?),
             RTCP_RTPFB => parse_rtcp_rtpfb(fmt, body)?,
             RTCP_PSFB => parse_rtcp_psfb(fmt, body)?,
             _ => return Err(RtpError::InvalidRtcp("unsupported RTCP packet type")),
@@ -340,6 +361,12 @@ pub fn marshal_rtcp_packets(packets: &[RtcpPacket]) -> RtpResult<Vec<u8>> {
                 rr.report_blocks.len() as u8,
                 RTCP_RR,
                 build_receiver_report_body(rr)?,
+            ),
+            RtcpPacket::SourceDescription(sdes) => write_rtcp_packet(
+                &mut out,
+                sdes.chunks.len() as u8,
+                RTCP_SDES,
+                build_sdes_body(sdes),
             ),
             RtcpPacket::PictureLossIndication(pli) => write_rtcp_packet(
                 &mut out,
@@ -426,6 +453,54 @@ fn parse_receiver_report(fmt: u8, body: &[u8]) -> RtpResult<ReceiverReport> {
         sender_ssrc,
         report_blocks,
     })
+}
+
+fn parse_sdes(count: u8, body: &[u8]) -> RtpResult<SourceDescription> {
+    let mut chunks = Vec::with_capacity(count as usize);
+    let mut offset = 0;
+    for _ in 0..count {
+        if body.len() < offset + 4 {
+            return Err(RtpError::PacketTooShort);
+        }
+        let ssrc = u32::from_be_bytes([
+            body[offset],
+            body[offset + 1],
+            body[offset + 2],
+            body[offset + 3],
+        ]);
+        offset += 4;
+        let mut items = Vec::new();
+        loop {
+            if offset >= body.len() {
+                break;
+            }
+            let ty = body[offset];
+            offset += 1;
+            if ty == 0 {
+                // End of list, skip padding until 32-bit boundary
+                while offset % 4 != 0 {
+                    if offset >= body.len() {
+                        break;
+                    }
+                    offset += 1;
+                }
+                break;
+            }
+            if offset >= body.len() {
+                return Err(RtpError::PacketTooShort);
+            }
+            let len = body[offset] as usize;
+            offset += 1;
+            if body.len() < offset + len {
+                return Err(RtpError::PacketTooShort);
+            }
+            let text = String::from_utf8_lossy(&body[offset..offset + len]).to_string();
+            items.push(SdesItem { ty, text });
+            offset += len;
+        }
+        chunks.push(SdesChunk { ssrc, items });
+    }
+    Ok(SourceDescription { chunks })
 }
 
 fn parse_report_block(bytes: &[u8]) -> ReportBlock {
@@ -602,6 +677,23 @@ fn build_receiver_report_body(rr: &ReceiverReport) -> RtpResult<Vec<u8>> {
         body.extend_from_slice(&build_report_block(block));
     }
     Ok(body)
+}
+
+fn build_sdes_body(sdes: &SourceDescription) -> Vec<u8> {
+    let mut body = Vec::new();
+    for chunk in &sdes.chunks {
+        body.extend_from_slice(&chunk.ssrc.to_be_bytes());
+        for item in &chunk.items {
+            body.push(item.ty);
+            body.push(item.text.len() as u8);
+            body.extend_from_slice(item.text.as_bytes());
+        }
+        body.push(0); // End of list
+        while body.len() % 4 != 0 {
+            body.push(0);
+        }
+    }
+    body
 }
 
 fn build_report_block(block: &ReportBlock) -> [u8; 24] {

@@ -53,12 +53,8 @@ async fn test_interop_rustrtc_client_webrtc_server() -> Result<()> {
     let socket_reader = Arc::new(client_socket);
     let socket_writer = socket_reader.clone();
 
-    let client_conn = Arc::new(IceConn {
-        socket: IceSocketWrapper::Udp(socket_writer),
-        remote_addr: tokio::sync::RwLock::new(server_addr),
-        dtls_receiver: tokio::sync::RwLock::new(None),
-        rtp_receiver: tokio::sync::RwLock::new(None),
-    });
+    let (socket_tx, _) = tokio::sync::watch::channel(Some(IceSocketWrapper::Udp(socket_writer)));
+    let client_conn = IceConn::new(socket_tx.subscribe(), server_addr);
 
     // Start read loop
     let conn_clone = client_conn.clone();

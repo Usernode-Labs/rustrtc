@@ -5,20 +5,23 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, watch};
 use tracing::{debug, warn};
 
 pub struct IceConn {
-    pub socket: IceSocketWrapper,
+    pub socket_rx: watch::Receiver<Option<IceSocketWrapper>>,
     pub remote_addr: RwLock<SocketAddr>,
     pub dtls_receiver: RwLock<Option<Arc<dyn PacketReceiver>>>,
     pub rtp_receiver: RwLock<Option<Arc<dyn PacketReceiver>>>,
 }
 
 impl IceConn {
-    pub fn new(socket: IceSocketWrapper, remote_addr: SocketAddr) -> Arc<Self> {
+    pub fn new(
+        socket_rx: watch::Receiver<Option<IceSocketWrapper>>,
+        remote_addr: SocketAddr,
+    ) -> Arc<Self> {
         Arc::new(Self {
-            socket,
+            socket_rx,
             remote_addr: RwLock::new(remote_addr),
             dtls_receiver: RwLock::new(None),
             rtp_receiver: RwLock::new(None),
@@ -34,11 +37,40 @@ impl IceConn {
     }
 
     pub async fn send(&self, buf: &[u8]) -> Result<usize> {
-        let remote = *self.remote_addr.read().await;
-        if remote.port() == 0 {
-            return Err(anyhow::anyhow!("Remote address not set"));
+        let mut socket_rx = self.socket_rx.clone();
+        let mut socket_opt = socket_rx.borrow_and_update().clone();
+
+        if socket_opt.is_none() {
+            tracing::debug!("IceConn: waiting for socket... (initial check)");
+            match tokio::time::timeout(std::time::Duration::from_secs(2), socket_rx.changed()).await
+            {
+                Ok(Ok(())) => {
+                    socket_opt = socket_rx.borrow().clone();
+                    if socket_opt.is_some() {
+                        tracing::debug!("IceConn: socket became available");
+                    } else {
+                        tracing::warn!("IceConn: socket changed but is still None");
+                    }
+                }
+                Ok(Err(_)) => {
+                    tracing::warn!("IceConn: socket_rx channel closed");
+                }
+                Err(_) => {
+                    tracing::warn!("IceConn: timeout waiting for socket");
+                }
+            }
         }
-        self.socket.send_to(buf, remote).await
+
+        if let Some(socket) = socket_opt {
+            let remote = *self.remote_addr.read().await;
+            if remote.port() == 0 {
+                return Err(anyhow::anyhow!("Remote address not set"));
+            }
+            socket.send_to(buf, remote).await
+        } else {
+            tracing::warn!("IceConn: send failed - no selected socket");
+            Err(anyhow::anyhow!("No selected socket"))
+        }
     }
 }
 
@@ -50,6 +82,11 @@ impl PacketReceiver for IceConn {
         }
 
         let first_byte = packet[0];
+        tracing::trace!(
+            "IceConn: receive packet len={} first_byte={}",
+            packet.len(),
+            first_byte
+        );
         let current_remote = *self.remote_addr.read().await;
 
         // If remote_addr is unspecified (port 0), accept and update
@@ -77,13 +114,6 @@ impl PacketReceiver for IceConn {
                 );
             }
         }
-
-        debug!(
-            "IceConn: Received packet from {:?} len={} first_byte={}",
-            addr,
-            packet.len(),
-            first_byte
-        );
 
         if (20..64).contains(&first_byte) {
             // DTLS

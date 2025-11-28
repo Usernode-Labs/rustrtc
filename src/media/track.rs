@@ -1,6 +1,6 @@
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, AtomicU64, Ordering},
+    atomic::{AtomicBool, Ordering},
 };
 
 use async_trait::async_trait;
@@ -8,8 +8,11 @@ use tokio::sync::{Mutex, broadcast, mpsc};
 use tracing::warn;
 
 use crate::{
-    media::error::{MediaError, MediaResult},
-    media::frame::{AudioFrame, MediaKind, MediaSample, VideoFrame},
+    media::{
+        error::{MediaError, MediaResult},
+        frame::{AudioFrame, MediaKind, MediaSample, VideoFrame},
+    },
+    transports::ice::stun::random_u64,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -72,16 +75,13 @@ pub struct SampleStreamSource {
     sender: mpsc::Sender<MediaSample>,
 }
 
-static TRACK_COUNTER: AtomicU64 = AtomicU64::new(1);
-static RELAY_TRACK_COUNTER: AtomicU64 = AtomicU64::new(1);
-
 fn next_track_id() -> Arc<str> {
-    let value = TRACK_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let value = random_u64();
     Arc::<str>::from(format!("track-{value}"))
 }
 
 fn next_relay_track_id(base: &str) -> Arc<str> {
-    let suffix = RELAY_TRACK_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let suffix = random_u64();
     Arc::<str>::from(format!("{base}-relay-{suffix}"))
 }
 
@@ -348,6 +348,8 @@ mod tests {
             samples: 960,
             format: AudioSampleFormat::S16,
             data: Bytes::from_static(&[0u8; 10]),
+            sequence_number: None,
+            payload_type: None,
         };
         source.send_audio(frame.clone()).await.unwrap();
         let sample = track.recv().await.unwrap();
@@ -362,12 +364,17 @@ mod tests {
         let (source, _track) = sample_track(MediaKind::Audio, 1);
         let video = VideoFrame {
             timestamp: Duration::from_secs(1),
+            rtp_timestamp: None,
             width: 640,
             height: 480,
             format: VideoPixelFormat::Rgba,
             rotation_deg: 0,
             is_last_packet: false,
             data: Bytes::new(),
+            header_extension: None,
+            csrcs: Vec::new(),
+            sequence_number: None,
+            payload_type: None,
         };
         let err = source.send_video(video).await.unwrap_err();
         assert!(matches!(err, MediaError::KindMismatch { .. }));
@@ -395,6 +402,8 @@ mod tests {
             samples: 480,
             format: AudioSampleFormat::S16,
             data: Bytes::from_static(&[1u8; 4]),
+            sequence_number: None,
+            payload_type: None,
         };
         source.send_audio(frame.clone()).await.unwrap();
 

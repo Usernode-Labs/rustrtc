@@ -3,7 +3,7 @@ use anyhow::Result;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use std::sync::Arc;
 use tokio::sync::{Mutex, mpsc};
-use tracing::{debug, trace, warn};
+use tracing::{trace, warn};
 
 pub struct SctpTransport {
     dtls_transport: Arc<DtlsTransport>,
@@ -102,7 +102,6 @@ impl SctpTransport {
 
     async fn run_loop(&self) {
         *self.state.lock().await = SctpState::Connecting;
-
         loop {
             match self.dtls_transport.recv().await {
                 Ok(packet) => {
@@ -161,7 +160,7 @@ impl SctpTransport {
                 CT_DATA => self.handle_data(chunk_flags, chunk_value).await?,
                 CT_HEARTBEAT => self.handle_heartbeat(chunk_value).await?,
                 _ => {
-                    debug!("Unhandled SCTP chunk type: {}", chunk_type);
+                    trace!("Unhandled SCTP chunk type: {}", chunk_type);
                 }
             }
         }
@@ -169,7 +168,6 @@ impl SctpTransport {
     }
 
     async fn handle_init(&self, _remote_tag: u32, chunk: Bytes) -> Result<()> {
-        debug!("Received SCTP INIT");
         let mut buf = chunk;
         if buf.remaining() < 16 {
             // Fixed params
@@ -219,9 +217,6 @@ impl SctpTransport {
     }
 
     async fn handle_cookie_echo(&self, _chunk: Bytes) -> Result<()> {
-        debug!("Received SCTP COOKIE ECHO");
-        // Verify cookie (skip for now)
-
         // Send COOKIE ACK
         self.send_chunk(
             CT_COOKIE_ACK,
@@ -232,8 +227,6 @@ impl SctpTransport {
         .await?;
 
         *self.state.lock().await = SctpState::Connected;
-        debug!("SCTP Connected");
-
         {
             let channels = self.data_channels.lock().await;
             for dc in channels.iter() {
@@ -246,7 +239,6 @@ impl SctpTransport {
     }
 
     async fn handle_heartbeat(&self, chunk: Bytes) -> Result<()> {
-        debug!("Received SCTP HEARTBEAT");
         // Send HEARTBEAT ACK with same info
         // ...
 
@@ -261,7 +253,6 @@ impl SctpTransport {
     }
 
     async fn handle_data(&self, _flags: u8, chunk: Bytes) -> Result<()> {
-        debug!("Received SCTP DATA");
         let mut buf = chunk;
         if buf.remaining() < 12 {
             return Ok(());
@@ -295,13 +286,6 @@ impl SctpTransport {
         )
         .await?;
 
-        // Dispatch to channel
-        // For now, just print
-        if let Ok(s) = std::str::from_utf8(&user_data) {
-            debug!("Received Data: {}", s);
-        }
-
-        // Store in the correct channel
         let channels = self.data_channels.lock().await;
         if let Some(dc) = channels.iter().find(|c| c.id == stream_id) {
             dc.send_event(DataChannelEvent::Message(user_data.to_vec()));

@@ -71,7 +71,6 @@ impl RtpTransport {
         }
         let bytes = packet.marshal().context("marshal RTP")?;
         if let Some(conn) = &*self.ice_conn.lock().await {
-            debug!("RtpTransport sending {} bytes via ICE", bytes.len());
             conn.send(&bytes).await.context("send RTP via ICE")?;
             Ok(())
         } else {
@@ -90,7 +89,6 @@ impl RtpTransport {
             }
         }
         if let Some(conn) = &*self.ice_conn.lock().await {
-            debug!("RtpTransport sending {} bytes RTCP via ICE", bytes.len());
             conn.send(&bytes).await.context("send RTCP via ICE")?;
             Ok(())
         } else {
@@ -115,14 +113,16 @@ impl PacketReceiver for RtpTransport {
                 }
             }
             // Parse RTCP packets
-            if let Ok(packets) = parse_rtcp_packets(&packet_vec) {
-                debug!("Received RTCP packets: {:?}", packets);
-                let listeners = self.rtcp_listeners.lock().await;
-                for listener in listeners.iter() {
-                    let _ = listener.send(packets.clone()).await;
+            match parse_rtcp_packets(&packet_vec) {
+                Ok(packets) => {
+                    let listeners = self.rtcp_listeners.lock().await;
+                    for listener in listeners.iter() {
+                        let _ = listener.send(packets.clone()).await;
+                    }
                 }
-            } else {
-                debug!("Failed to parse RTCP packets");
+                Err(e) => {
+                    warn!("Failed to parse RTCP packets: {:?}", e);
+                }
             }
             return;
         }
@@ -141,16 +141,8 @@ impl PacketReceiver for RtpTransport {
             let ssrc = rtp.header.ssrc;
             let listeners = self.listeners.lock().await;
             if let Some(sender) = listeners.get(&ssrc) {
-                debug!(
-                    "RtpTransport dispatching RTP packet ssrc={} to listener",
-                    ssrc
-                );
                 let _ = sender.send(rtp).await;
             } else {
-                debug!(
-                    "RtpTransport received RTP packet ssrc={} but no listener found",
-                    ssrc
-                );
             }
         } else {
             debug!("RtpTransport received non-RTP packet len={}", packet.len());

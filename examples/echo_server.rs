@@ -10,7 +10,6 @@ use rustrtc::{RtcConfiguration, SdpType, SessionDescription};
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 use tower_http::services::ServeDir;
 use tracing::{info, warn};
@@ -172,7 +171,43 @@ async fn handle_webrtc_rs_offer(payload: OfferRequest) -> Json<OfferResponse> {
     })
 }
 async fn handle_rustrtc_offer(payload: OfferRequest) -> Json<OfferResponse> {
-    let config = RtcConfiguration::default();
+    info!("Offer SDP:\n{}", payload.sdp);
+    // Handle SDP first to extract capabilities
+    let offer_sdp = SessionDescription::parse(SdpType::Offer, &payload.sdp).unwrap();
+
+    // Find VP8 payload type
+    let mut vp8_pt = 96; // Default
+    for section in &offer_sdp.media_sections {
+        if section.kind == rustrtc::MediaKind::Video {
+            for attr in &section.attributes {
+                if attr.key == "rtpmap" {
+                    if let Some(val) = &attr.value {
+                        if val.contains("VP8") {
+                            // Format: "96 VP8/90000"
+                            if let Some(pt_str) = val.split_whitespace().next() {
+                                if let Ok(pt) = pt_str.parse::<u8>() {
+                                    vp8_pt = pt;
+                                    info!("Found VP8 payload type: {}", vp8_pt);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let mut config = RtcConfiguration::default();
+    // Configure media capabilities with the found PT
+    let mut caps = rustrtc::config::MediaCapabilities::default();
+    caps.video = vec![rustrtc::config::VideoCapability {
+        payload_type: vp8_pt,
+        codec_name: "VP8".to_string(),
+        clock_rate: 90000,
+        rtcp_fbs: vec!["nack pli".to_string(), "transport-cc".to_string()],
+    }];
+    config.media_capabilities = Some(caps);
+
     let pc = PeerConnection::new(config);
 
     // Create DataChannel (negotiated id=0)
@@ -208,11 +243,88 @@ async fn handle_rustrtc_offer(payload: OfferRequest) -> Json<OfferResponse> {
         }
     });
 
-    // Handle SDP
-    let offer_sdp = SessionDescription::parse(SdpType::Offer, &payload.sdp).unwrap();
     pc.set_remote_description(offer_sdp).await.unwrap();
 
-    configure_rustrtc_video_echo(&pc).await;
+    // Configure video echo
+    let transceivers = pc.get_transceivers().await;
+    for transceiver in transceivers {
+        if transceiver.kind() != rustrtc::MediaKind::Video {
+            continue;
+        }
+
+        transceiver
+            .set_direction(rustrtc::TransceiverDirection::SendRecv)
+            .await;
+
+        let receiver = transceiver.receiver.lock().await.clone();
+        let Some(receiver) = receiver else {
+            warn!("Video transceiver {} missing receiver", transceiver.id());
+            continue;
+        };
+
+        let incoming_track = receiver.track();
+        let (sample_source, outgoing_track) = media::sample_track(MediaStreamKind::Video, 120);
+
+        let ssrc = 5000 + transceiver.id() as u32;
+        let sender = Arc::new(rustrtc::peer_connection::RtpSender::new(
+            outgoing_track.clone(),
+            ssrc,
+        ));
+
+        // Update params with correct PT
+        sender
+            .set_params(rustrtc::peer_connection::RtpCodecParameters {
+                payload_type: vp8_pt,
+                clock_rate: 90000,
+                channels: 0,
+            })
+            .await;
+
+        *transceiver.sender.lock().await = Some(sender);
+
+        let receiver_for_keyframe = receiver.clone();
+        let transceiver_id = transceiver.id();
+        tokio::spawn(async move {
+            for attempt in 0..20 {
+                match receiver_for_keyframe.request_key_frame().await {
+                    Ok(_) => {
+                        info!(
+                            "Requested upstream keyframe for video transceiver {}",
+                            transceiver_id
+                        );
+                        break;
+                    }
+                    Err(err) => {
+                        if attempt == 19 {
+                            warn!(
+                                "Failed to request keyframe for transceiver {}: {}",
+                                transceiver_id, err
+                            );
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_millis(200)).await;
+                    }
+                }
+            }
+        });
+
+        tokio::spawn(async move {
+            loop {
+                match incoming_track.recv().await {
+                    Ok(sample) => {
+                        if let Err(err) = sample_source.send(sample).await {
+                            warn!("Video echo forwarder stopped: {}", err);
+                            break;
+                        }
+                    }
+                    Err(err) => {
+                        warn!("Video ingress track ended: {}", err);
+                        break;
+                    }
+                }
+            }
+        });
+    }
 
     // Create answer and wait for gathering
     let _ = pc.create_answer().await.unwrap();
@@ -236,58 +348,52 @@ async fn handle_rustrtc_offer(payload: OfferRequest) -> Json<OfferResponse> {
     })
 }
 
-static VIDEO_SSRC_COUNTER: AtomicU32 = AtomicU32::new(0x0099_0001);
+// async fn configure_rustrtc_video_echo(pc: &PeerConnection) {
+//     let transceivers = pc.get_transceivers().await;
+//     for transceiver in transceivers {
+//         if transceiver.kind() != rustrtc::MediaKind::Video {
+//             continue;
+//         }
 
-async fn configure_rustrtc_video_echo(pc: &PeerConnection) {
-    let transceivers = pc.get_transceivers().await;
-    for transceiver in transceivers {
-        if transceiver.kind() != rustrtc::MediaKind::Video {
-            continue;
-        }
+//         transceiver
+//             .set_direction(rustrtc::TransceiverDirection::SendRecv)
+//             .await;
 
-        transceiver
-            .set_direction(rustrtc::TransceiverDirection::SendRecv)
-            .await;
+//         let receiver = transceiver.receiver.lock().await.clone();
+//         let Some(receiver) = receiver else {
+//             warn!("Video transceiver {} missing receiver", transceiver.id());
+//             continue;
+//         };
 
-        let receiver = transceiver.receiver.lock().await.clone();
-        let Some(receiver) = receiver else {
-            warn!("Video transceiver {} missing receiver", transceiver.id());
-            continue;
-        };
+//         let incoming_track = receiver.track();
+//         let (sample_source, outgoing_track) = media::sample_track(MediaStreamKind::Video, 120);
 
-        let incoming_track = receiver.track();
-        let (sample_source, outgoing_track) = media::sample_track(MediaStreamKind::Video, 120);
+//         let sender = Arc::new(rustrtc::peer_connection::RtpSender::new(
+//             outgoing_track.clone(),
+//             next_video_ssrc(),
+//         ));
+//         *transceiver.sender.lock().await = Some(sender);
 
-        let sender = Arc::new(rustrtc::peer_connection::RtpSender::new(
-            outgoing_track.clone(),
-            next_video_ssrc(),
-        ));
-        *transceiver.sender.lock().await = Some(sender);
+//         tokio::spawn(async move {
+//             loop {
+//                 match incoming_track.recv().await {
+//                     Ok(sample) => {
+//                         if let Err(err) = sample_source.send(sample).await {
+//                             warn!("Video echo forwarder stopped: {}", err);
+//                             break;
+//                         }
+//                     }
+//                     Err(err) => {
+//                         warn!("Video ingress track ended: {}", err);
+//                         break;
+//                     }
+//                 }
+//             }
+//         });
 
-        tokio::spawn(async move {
-            loop {
-                match incoming_track.recv().await {
-                    Ok(sample) => {
-                        if let Err(err) = sample_source.send(sample).await {
-                            warn!("Video echo forwarder stopped: {}", err);
-                            break;
-                        }
-                    }
-                    Err(err) => {
-                        warn!("Video ingress track ended: {}", err);
-                        break;
-                    }
-                }
-            }
-        });
-
-        info!(
-            "Configured RustRTC video echo on transceiver {}",
-            transceiver.id()
-        );
-    }
-}
-
-fn next_video_ssrc() -> u32 {
-    VIDEO_SSRC_COUNTER.fetch_add(1, Ordering::Relaxed)
-}
+//         info!(
+//             "Configured RustRTC video echo on transceiver {}",
+//             transceiver.id()
+//         );
+//     }
+// }

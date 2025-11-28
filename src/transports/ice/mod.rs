@@ -45,6 +45,9 @@ struct IceTransportInner {
     remote_parameters: Mutex<Option<IceParameters>>,
     pending_transactions: Mutex<HashMap<[u8; 12], oneshot::Sender<StunDecoded>>>,
     data_receiver: Mutex<Option<Arc<dyn PacketReceiver>>>,
+    buffered_packets: Mutex<Vec<(Vec<u8>, SocketAddr)>>,
+    selected_socket: watch::Sender<Option<IceSocketWrapper>>,
+    _socket_rx_keeper: watch::Receiver<Option<IceSocketWrapper>>,
 }
 
 impl std::fmt::Debug for IceTransportInner {
@@ -62,6 +65,8 @@ impl std::fmt::Debug for IceTransportInner {
             .field("remote_parameters", &self.remote_parameters)
             .field("pending_transactions", &self.pending_transactions)
             .field("data_receiver", &"PacketReceiver")
+            .field("buffered_packets", &self.buffered_packets)
+            .field("selected_socket", &self.selected_socket)
             .finish()
     }
 }
@@ -70,6 +75,7 @@ impl IceTransport {
     pub fn new(config: RtcConfiguration) -> Self {
         let gatherer = IceGatherer::new(config.clone());
         let (state_tx, _) = watch::channel(IceTransportState::New);
+        let (socket_tx, socket_rx) = watch::channel(None);
         let inner = IceTransportInner {
             state: state_tx,
             role: Mutex::new(IceRole::Controlled),
@@ -83,6 +89,9 @@ impl IceTransport {
             remote_parameters: Mutex::new(None),
             pending_transactions: Mutex::new(HashMap::new()),
             data_receiver: Mutex::new(None),
+            buffered_packets: Mutex::new(Vec::new()),
+            selected_socket: socket_tx,
+            _socket_rx_keeper: socket_rx,
         };
         Self {
             inner: Arc::new(inner),
@@ -95,6 +104,10 @@ impl IceTransport {
 
     pub fn subscribe_state(&self) -> watch::Receiver<IceTransportState> {
         self.inner.state.subscribe()
+    }
+
+    pub fn subscribe_selected_socket(&self) -> watch::Receiver<Option<IceSocketWrapper>> {
+        self.inner.selected_socket.subscribe()
     }
 
     pub async fn gather_state(&self) -> IceGathererState {
@@ -160,7 +173,10 @@ impl IceTransport {
         let remote = IceCandidate::host(remote_addr, 1);
         let pair = IceCandidatePair::new(local, remote);
 
-        *self.inner.selected_pair.lock().await = Some(pair);
+        *self.inner.selected_pair.lock().await = Some(pair.clone());
+        if let Some(socket) = resolve_socket(&self.inner, &pair).await {
+            let _ = self.inner.selected_socket.send(Some(socket));
+        }
         let _ = self.inner.state.send(IceTransportState::Connected);
         Ok(())
     }
@@ -182,6 +198,9 @@ impl IceTransport {
 
     pub async fn select_pair(&self, pair: IceCandidatePair) {
         *self.inner.selected_pair.lock().await = Some(pair.clone());
+        if let Some(socket) = resolve_socket(&self.inner, &pair).await {
+            let _ = self.inner.selected_socket.send(Some(socket));
+        }
         let _ = self.inner.state.send(IceTransportState::Connected);
     }
 
@@ -210,7 +229,17 @@ impl IceTransport {
     }
 
     pub async fn set_data_receiver(&self, receiver: Arc<dyn PacketReceiver>) {
-        *self.inner.data_receiver.lock().await = Some(receiver);
+        let mut rx_lock = self.inner.data_receiver.lock().await;
+        *rx_lock = Some(receiver.clone());
+        drop(rx_lock);
+
+        let mut buffer = self.inner.buffered_packets.lock().await;
+        if !buffer.is_empty() {
+            debug!("Flushing {} buffered packets", buffer.len());
+            for (packet, addr) in buffer.drain(..) {
+                receiver.receive(Bytes::from(packet), addr).await;
+            }
+        }
     }
 
     fn try_connectivity_checks(&self) {
@@ -220,108 +249,135 @@ impl IceTransport {
     async fn start_read_loops(&self) {
         let sockets = self.inner.gatherer.sockets.lock().await;
         for socket in sockets.iter() {
-            let socket = socket.clone();
-            let inner = self.inner.clone();
-            let mut state_rx = self.inner.state.subscribe();
-            tokio::spawn(async move {
-                let mut buf = [0u8; 1500];
-                trace!("Read loop started for {:?}", socket.local_addr());
-                loop {
-                    tokio::select! {
-                        res = socket.recv_from(&mut buf) => {
-                            let (len, addr) = match res {
-                                Ok(v) => v,
-                                Err(e) => {
-                                    debug!("Socket recv error: {}", e);
-                                    break;
-                                }
-                            };
-                            let packet = &buf[..len];
-                            if len > 0 {
-                                handle_packet(packet, addr, inner.clone(), IceSocketWrapper::Udp(socket.clone()))
-                                    .await;
-                            }
-                        }
-                        _ = state_rx.changed() => {
-                            if *state_rx.borrow() == IceTransportState::Closed {
-                                debug!("Read loop stopping (IceTransport Closed)");
-                                break;
-                            }
-                        }
-                    }
-                }
-            });
+            Self::spawn_udp_read_loop(socket.clone(), self.inner.clone());
         }
 
         let turn_clients = self.inner.gatherer.turn_clients.lock().await;
         for (relayed_addr, client) in turn_clients.iter() {
-            let client = client.clone();
-            let inner = self.inner.clone();
-            let relayed_addr = *relayed_addr;
-            let mut state_rx = self.inner.state.subscribe();
-            tokio::spawn(async move {
-                let mut buf = [0u8; 1500];
-                trace!("Read loop started for TURN client {}", relayed_addr);
-                loop {
-                    let recv_future = async {
-                        let client_lock = client.lock().await;
-                        let result = client_lock.recv(&mut buf).await;
-                        drop(client_lock); // Release lock
-                        result
-                    };
+            Self::spawn_turn_read_loop(client.clone(), *relayed_addr, self.inner.clone());
+        }
+    }
 
-                    tokio::select! {
-                        result = recv_future => {
-                            match result {
-                                Ok(len) => {
-                                    if len > 0 {
-                                        let packet = &buf[..len];
-                                        if let Ok(msg) = StunMessage::decode(packet) {
-                                            if msg.class == StunClass::Indication
-                                                && msg.method == StunMethod::Data
-                                            {
-                                                if let Some(data) = &msg.data {
-                                                    if let Some(peer_addr) = msg.xor_peer_address {
-                                                        handle_packet(
-                                                            data,
-                                                            peer_addr,
-                                                            inner.clone(),
-                                                            IceSocketWrapper::Turn(client.clone()),
-                                                        )
-                                                        .await;
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                                Err(e) => {
-                                    warn!("TURN client recv error: {}", e);
-                                    break;
+    fn spawn_udp_read_loop(socket: Arc<UdpSocket>, inner: Arc<IceTransportInner>) {
+        let mut state_rx = inner.state.subscribe();
+        tokio::spawn(async move {
+            let mut buf = [0u8; 1500];
+            trace!("Read loop started for {:?}", socket.local_addr());
+            loop {
+                tokio::select! {
+                    res = socket.recv_from(&mut buf) => {
+                        let (len, addr) = match res {
+                            Ok(v) => v,
+                            Err(e) => {
+                                debug!("Socket recv error: {}", e);
+                                break;
+                            }
+                        };
+                        let packet = &buf[..len];
+                        if len > 0 {
+                            handle_packet(
+                                packet,
+                                addr,
+                                inner.clone(),
+                                IceSocketWrapper::Udp(socket.clone()),
+                            )
+                            .await;
+                        }
+                    }
+                    _ = state_rx.changed() => {
+                        if *state_rx.borrow() == IceTransportState::Closed {
+                            debug!("Read loop stopping (IceTransport Closed)");
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    fn spawn_turn_read_loop(
+        client: Arc<Mutex<TurnClient>>,
+        relayed_addr: SocketAddr,
+        inner: Arc<IceTransportInner>,
+    ) {
+        let mut state_rx = inner.state.subscribe();
+        tokio::spawn(async move {
+            let mut buf = [0u8; 1500];
+            trace!("Read loop started for TURN client {}", relayed_addr);
+            loop {
+                let recv_future = async {
+                    let client_lock = client.lock().await;
+                    let result = client_lock.recv(&mut buf).await;
+                    drop(client_lock); // Release lock
+                    result
+                };
+
+                tokio::select! {
+                    result = recv_future => {
+                        match result {
+                            Ok(len) => {
+                                if len > 0 {
+                                    Self::handle_turn_packet(&buf[..len], &inner, &client).await;
                                 }
                             }
-                        }
-                        _ = state_rx.changed() => {
-                            if *state_rx.borrow() == IceTransportState::Closed {
-                                debug!("TURN Read loop stopping (IceTransport Closed)");
+                            Err(e) => {
+                                warn!("TURN client recv error: {}", e);
                                 break;
                             }
                         }
                     }
+                    _ = state_rx.changed() => {
+                        if *state_rx.borrow() == IceTransportState::Closed {
+                            debug!("TURN Read loop stopping (IceTransport Closed)");
+                            break;
+                        }
+                    }
                 }
-            });
+            }
+        });
+    }
+
+    async fn handle_turn_packet(
+        packet: &[u8],
+        inner: &Arc<IceTransportInner>,
+        client: &Arc<Mutex<TurnClient>>,
+    ) {
+        if let Ok(msg) = StunMessage::decode(packet) {
+            if msg.class == StunClass::Indication && msg.method == StunMethod::Data {
+                if let Some(data) = &msg.data {
+                    if let Some(peer_addr) = msg.xor_peer_address {
+                        handle_packet(
+                            data,
+                            peer_addr,
+                            inner.clone(),
+                            IceSocketWrapper::Turn(client.clone()),
+                        )
+                        .await;
+                    }
+                }
+            }
         }
     }
 }
 
 fn try_connectivity_checks(inner: Arc<IceTransportInner>) {
     tokio::spawn(async move {
-        if *inner.state.borrow() != IceTransportState::Checking {
+        let state = *inner.state.borrow();
+        if state != IceTransportState::Checking {
+            trace!("try_connectivity_checks: state is {:?}, skipping", state);
             return;
         }
         let locals = inner.local_candidates.lock().await.clone();
         let remotes = inner.remote_candidates.lock().await.clone();
         let role = *inner.role.lock().await;
+
+        trace!(
+            "try_connectivity_checks: locals={} remotes={} role={:?}",
+            locals.len(),
+            remotes.len(),
+            role
+        );
+
         if locals.is_empty() || remotes.is_empty() {
             return;
         }
@@ -353,7 +409,7 @@ fn try_connectivity_checks(inner: Arc<IceTransportInner>) {
                             let _ = tx.send(IceCandidatePair::new(local, remote)).await;
                         }
                         Err(e) => {
-                            debug!(
+                            trace!(
                                 "ICE check failed: {} -> {} : {}",
                                 local.address, remote.address, e
                             );
@@ -373,7 +429,12 @@ fn try_connectivity_checks(inner: Arc<IceTransportInner>) {
                 "Selected pair: {} -> {}",
                 pair.local.address, pair.remote.address
             );
-            *inner.selected_pair.lock().await = Some(pair);
+            *inner.selected_pair.lock().await = Some(pair.clone());
+            if let Some(socket) = resolve_socket(&inner, &pair).await {
+                let _ = inner.selected_socket.send(Some(socket));
+            } else {
+                debug!("Selected socket NOT found for pair {:?}", pair);
+            }
             let _ = inner.state.send(IceTransportState::Connected);
         } else {
             // If all failed (channel closed because all senders dropped? No, we hold one tx clone? No, we dropped it?)
@@ -385,12 +446,34 @@ fn try_connectivity_checks(inner: Arc<IceTransportInner>) {
     });
 }
 
+async fn resolve_socket(
+    inner: &IceTransportInner,
+    pair: &IceCandidatePair,
+) -> Option<IceSocketWrapper> {
+    if pair.local.typ == IceCandidateType::Relay {
+        let clients = inner.gatherer.turn_clients.lock().await;
+        clients
+            .get(&pair.local.address)
+            .map(|c| IceSocketWrapper::Turn(c.clone()))
+    } else {
+        let socket = inner.gatherer.get_socket(pair.local.address).await;
+        if socket.is_none() {
+            warn!(
+                "resolve_socket: failed to find socket for {}",
+                pair.local.address
+            );
+        }
+        socket.map(IceSocketWrapper::Udp)
+    }
+}
+
 async fn handle_packet(
     packet: &[u8],
     addr: SocketAddr,
     inner: Arc<IceTransportInner>,
     sender: IceSocketWrapper,
 ) {
+    trace!("Received packet from {} len={}", addr, packet.len());
     let b = packet[0];
     if b < 2 {
         // STUN
@@ -414,9 +497,14 @@ async fn handle_packet(
                             msg.transaction_id,
                             map.keys()
                         );
+                        warn!("Unmatched STUN transaction {:?}", msg.transaction_id);
                     }
                 } else if msg.class == StunClass::ErrorResponse {
                     trace!("Received STUN Error Response from {}", addr);
+                    warn!(
+                        "Received STUN Error Response from {}: {:?}",
+                        addr, msg.error_code
+                    );
                     if let Some(code) = msg.error_code {
                         trace!("Error code: {}", code);
                     }
@@ -428,10 +516,21 @@ async fn handle_packet(
         }
     } else {
         // DTLS or RTP
-        debug!("Received non-STUN packet from {}, first byte: {}", addr, b);
         let receiver = inner.data_receiver.lock().await.clone();
         if let Some(rx) = receiver {
             rx.receive(Bytes::copy_from_slice(packet), addr).await;
+        } else {
+            let mut buffer = inner.buffered_packets.lock().await;
+            if buffer.len() < 100 {
+                buffer.push((packet.to_vec(), addr));
+                trace!(
+                    "Buffered packet from {} (buffer size: {})",
+                    addr,
+                    buffer.len()
+                );
+            } else {
+                warn!("Buffer full, dropping packet from {}", addr);
+            }
         }
     }
 }
@@ -899,6 +998,19 @@ impl IceGatherer {
                 }
             }
         }
+        // Avoid unwrap in logging to prevent panic hiding
+        let available: Vec<String> = sockets
+            .iter()
+            .map(|s| {
+                s.local_addr()
+                    .map(|a| a.to_string())
+                    .unwrap_or_else(|_| "error".to_string())
+            })
+            .collect();
+        warn!(
+            "get_socket: no socket found for {}, available: {:?}",
+            addr, available
+        );
         None
     }
 

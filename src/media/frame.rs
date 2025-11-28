@@ -3,6 +3,8 @@ use std::time::Duration;
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 
+use crate::rtp::{RtpHeader, RtpHeaderExtension, RtpPacket};
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum MediaKind {
     Audio,
@@ -37,6 +39,8 @@ pub struct AudioFrame {
     pub samples: u32,
     pub format: AudioSampleFormat,
     pub data: Bytes,
+    pub sequence_number: Option<u16>,
+    pub payload_type: Option<u8>,
 }
 
 impl Default for AudioFrame {
@@ -48,6 +52,8 @@ impl Default for AudioFrame {
             samples: 0,
             format: AudioSampleFormat::default(),
             data: Bytes::new(),
+            sequence_number: None,
+            payload_type: None,
         }
     }
 }
@@ -55,24 +61,34 @@ impl Default for AudioFrame {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct VideoFrame {
     pub timestamp: Duration,
+    pub rtp_timestamp: Option<u32>,
     pub width: u16,
     pub height: u16,
     pub format: VideoPixelFormat,
     pub rotation_deg: u16,
     pub is_last_packet: bool,
     pub data: Bytes,
+    pub header_extension: Option<RtpHeaderExtension>,
+    pub csrcs: Vec<u32>,
+    pub sequence_number: Option<u16>,
+    pub payload_type: Option<u8>,
 }
 
 impl Default for VideoFrame {
     fn default() -> Self {
         Self {
             timestamp: Duration::default(),
+            rtp_timestamp: None,
             width: 0,
             height: 0,
             format: VideoPixelFormat::default(),
             rotation_deg: 0,
             is_last_packet: false,
             data: Bytes::new(),
+            header_extension: None,
+            csrcs: Vec::new(),
+            sequence_number: None,
+            payload_type: None,
         }
     }
 }
@@ -88,6 +104,111 @@ impl MediaSample {
         match self {
             MediaSample::Audio(_) => MediaKind::Audio,
             MediaSample::Video(_) => MediaKind::Video,
+        }
+    }
+
+    pub fn into_rtp_packet(
+        self,
+        ssrc: u32,
+        clock_rate: u32,
+        default_payload_type: u8,
+        sequence_number: &mut u16,
+    ) -> RtpPacket {
+        let (
+            payload,
+            timestamp_duration,
+            marker,
+            rtp_timestamp,
+            csrcs,
+            frame_seq,
+            frame_pt,
+            extension,
+        ) = match self {
+            MediaSample::Audio(f) => (
+                f.data,
+                f.timestamp,
+                false,
+                None,
+                Vec::new(),
+                f.sequence_number,
+                f.payload_type,
+                None,
+            ),
+            MediaSample::Video(f) => (
+                f.data,
+                f.timestamp,
+                f.is_last_packet,
+                f.rtp_timestamp,
+                f.csrcs,
+                f.sequence_number,
+                f.payload_type,
+                f.header_extension,
+            ),
+        };
+
+        let timestamp = rtp_timestamp
+            .unwrap_or_else(|| (timestamp_duration.as_secs_f64() * clock_rate as f64) as u32);
+
+        let seq = frame_seq.unwrap_or(*sequence_number);
+        if frame_seq.is_none() {
+            *sequence_number = sequence_number.wrapping_add(1);
+        }
+
+        let pt = frame_pt.unwrap_or(default_payload_type);
+        let mut header = RtpHeader::new(pt, seq, timestamp, ssrc);
+        header.marker = marker;
+        header.csrcs = csrcs;
+        header.extension = extension;
+
+        RtpPacket::new(header, payload.to_vec())
+    }
+
+    pub fn from_rtp_packet(
+        packet: RtpPacket,
+        kind: MediaKind,
+        clock_rate: u32,
+        channels: u8,
+    ) -> Self {
+        let timestamp = if clock_rate > 0 {
+            std::time::Duration::from_secs_f64(packet.header.timestamp as f64 / clock_rate as f64)
+        } else {
+            std::time::Duration::ZERO
+        };
+
+        let data = bytes::Bytes::from(packet.payload);
+
+        match kind {
+            MediaKind::Audio => {
+                let samples = if channels > 0 {
+                    (data.len() as u32) / (channels as u32 * 2)
+                } else {
+                    0
+                };
+                MediaSample::Audio(AudioFrame {
+                    timestamp,
+                    sample_rate: clock_rate,
+                    channels,
+                    samples,
+                    format: AudioSampleFormat::S16,
+                    data,
+                    sequence_number: Some(packet.header.sequence_number),
+                    payload_type: Some(packet.header.payload_type),
+                })
+            }
+            MediaKind::Video => MediaSample::Video(VideoFrame {
+                timestamp,
+                rtp_timestamp: Some(packet.header.timestamp),
+                width: 0,
+                height: 0,
+                format: VideoPixelFormat::Unspecified,
+                rotation_deg: 0,
+                is_last_packet: packet.header.marker,
+                data,
+                header_extension: packet.header.extension,
+                csrcs: packet.header.csrcs,
+                sequence_number: Some(packet.header.sequence_number),
+                payload_type: Some(packet.header.payload_type),
+            }),
         }
     }
 }

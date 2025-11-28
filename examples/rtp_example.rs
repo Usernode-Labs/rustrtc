@@ -33,6 +33,8 @@ async fn main() {
                 samples: 960,
                 format: Default::default(),
                 data: bytes::Bytes::from_static(&[0u8; 100]),
+                sequence_number: None,
+                payload_type: None,
             };
             if let Err(e) = source.send_audio(frame).await {
                 eprintln!("Failed to send audio: {:?}", e);

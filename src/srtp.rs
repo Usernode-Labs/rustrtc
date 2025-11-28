@@ -164,12 +164,18 @@ impl SrtpSession {
 }
 
 #[derive(Debug, Clone)]
-pub struct SrtpContext {
-    ssrc: u32,
-    _profile: SrtpProfile,
+struct SessionKeys {
     cipher_key: Vec<u8>,
     auth_key: Vec<u8>,
     salt: Vec<u8>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SrtpContext {
+    ssrc: u32,
+    _profile: SrtpProfile,
+    rtp_keys: SessionKeys,
+    rtcp_keys: SessionKeys,
     direction: SrtpDirection,
     rollover_counter: u32,
     last_sequence: Option<u16>,
@@ -189,18 +195,13 @@ impl SrtpContext {
             return Err(SrtpError::UnsupportedProfile);
         }
 
-        let (cipher_key, auth_key, salt) = if profile == SrtpProfile::NullCipherHmac {
-            Self::derive_keys(profile, &keying)?
-        } else {
-            Self::derive_keys(profile, &keying)?
-        };
+        let (rtp_keys, rtcp_keys) = Self::derive_keys(profile, &keying)?;
 
         Ok(Self {
             ssrc,
             _profile: profile,
-            cipher_key,
-            auth_key,
-            salt,
+            rtp_keys,
+            rtcp_keys,
             direction,
             rollover_counter: 0,
             last_sequence: None,
@@ -211,25 +212,41 @@ impl SrtpContext {
     fn derive_keys(
         profile: SrtpProfile,
         keying: &SrtpKeyingMaterial,
-    ) -> SrtpResult<(Vec<u8>, Vec<u8>, Vec<u8>)> {
+    ) -> SrtpResult<(SessionKeys, SessionKeys)> {
         let key_len = profile.key_len();
         let salt_len = profile.salt_len();
         let auth_len = profile.auth_key_len();
 
-        // Session Encryption Key: label 0x00
-        let cipher_key = Self::kdf(key_len, 0x00, &keying.master_key, &keying.master_salt)?;
-
-        // Session Authentication Key: label 0x01
-        let auth_key = if auth_len > 0 {
+        // RTP Keys
+        let rtp_cipher = Self::kdf(key_len, 0x00, &keying.master_key, &keying.master_salt)?;
+        let rtp_auth = if auth_len > 0 {
             Self::kdf(auth_len, 0x01, &keying.master_key, &keying.master_salt)?
         } else {
             Vec::new()
         };
+        let rtp_salt = Self::kdf(salt_len, 0x02, &keying.master_key, &keying.master_salt)?;
 
-        // Session Salt: label 0x02
-        let salt = Self::kdf(salt_len, 0x02, &keying.master_key, &keying.master_salt)?;
+        // RTCP Keys
+        let rtcp_cipher = Self::kdf(key_len, 0x03, &keying.master_key, &keying.master_salt)?;
+        let rtcp_auth = if auth_len > 0 {
+            Self::kdf(auth_len, 0x04, &keying.master_key, &keying.master_salt)?
+        } else {
+            Vec::new()
+        };
+        let rtcp_salt = Self::kdf(salt_len, 0x05, &keying.master_key, &keying.master_salt)?;
 
-        Ok((cipher_key, auth_key, salt))
+        Ok((
+            SessionKeys {
+                cipher_key: rtp_cipher,
+                auth_key: rtp_auth,
+                salt: rtp_salt,
+            },
+            SessionKeys {
+                cipher_key: rtcp_cipher,
+                auth_key: rtcp_auth,
+                salt: rtcp_salt,
+            },
+        ))
     }
 
     fn kdf(len: usize, label: u8, master_key: &[u8], master_salt: &[u8]) -> SrtpResult<Vec<u8>> {
@@ -330,7 +347,7 @@ impl SrtpContext {
         // IV = (k_s * 2^16) XOR (SSRC * 2^64) XOR (SRTCP_INDEX * 2^16)
 
         let mut iv = [0u8; 16];
-        for (i, &b) in self.salt.iter().take(14).enumerate() {
+        for (i, &b) in self.rtcp_keys.salt.iter().take(14).enumerate() {
             iv[i] = b;
         }
 
@@ -344,7 +361,7 @@ impl SrtpContext {
 
         // Keystream
         let mut cipher = Aes128Ctr::new(
-            GenericArray::from_slice(&self.cipher_key[..16]),
+            GenericArray::from_slice(&self.rtcp_keys.cipher_key[..16]),
             GenericArray::from_slice(&iv),
         );
 
@@ -355,7 +372,7 @@ impl SrtpContext {
     }
 
     fn auth_tag_rtcp(&self, data: &[u8]) -> SrtpResult<Vec<u8>> {
-        let mut mac = <HmacSha1 as Mac>::new_from_slice(&self.auth_key)
+        let mut mac = <HmacSha1 as Mac>::new_from_slice(&self.rtcp_keys.auth_key)
             .map_err(|_| SrtpError::UnsupportedProfile)?;
         mac.update(data);
         let result = mac.finalize().into_bytes();
@@ -368,7 +385,7 @@ impl SrtpContext {
 
         if let SrtpProfile::AeadAes128Gcm = self._profile {
             let nonce = self.build_gcm_nonce(packet.header.sequence_number, roc);
-            let cipher = Aes128Gcm::new_from_slice(&self.cipher_key)
+            let cipher = Aes128Gcm::new_from_slice(&self.rtp_keys.cipher_key)
                 .map_err(|_| SrtpError::UnsupportedProfile)?;
 
             // For GCM, AAD is the RTP header.
@@ -408,7 +425,7 @@ impl SrtpContext {
 
         if let SrtpProfile::AeadAes128Gcm = self._profile {
             let nonce = self.build_gcm_nonce(packet.header.sequence_number, roc);
-            let cipher = Aes128Gcm::new_from_slice(&self.cipher_key)
+            let cipher = Aes128Gcm::new_from_slice(&self.rtp_keys.cipher_key)
                 .map_err(|_| SrtpError::UnsupportedProfile)?;
 
             // Separate payload (ciphertext + tag) from header for AAD
@@ -452,7 +469,7 @@ impl SrtpContext {
             SrtpProfile::Aes128Sha1_80 | SrtpProfile::Aes128Sha1_32 => {
                 let iv = self.build_iv(packet.header.sequence_number, roc);
                 let mut cipher = Aes128Ctr::new(
-                    GenericArray::from_slice(&self.cipher_key[..16]),
+                    GenericArray::from_slice(&self.rtp_keys.cipher_key[..16]),
                     GenericArray::from_slice(&iv),
                 );
                 cipher.apply_keystream(&mut packet.payload);
@@ -463,7 +480,7 @@ impl SrtpContext {
     }
 
     fn auth_tag(&self, data: &[u8], roc: u32) -> SrtpResult<Vec<u8>> {
-        let mut mac = <HmacSha1 as Mac>::new_from_slice(&self.auth_key)
+        let mut mac = <HmacSha1 as Mac>::new_from_slice(&self.rtp_keys.auth_key)
             .map_err(|_| SrtpError::UnsupportedProfile)?;
         mac.update(data);
         mac.update(&roc.to_be_bytes());
@@ -474,7 +491,7 @@ impl SrtpContext {
 
     fn build_gcm_nonce(&self, sequence: u16, roc: u32) -> [u8; 12] {
         let mut iv = [0u8; 12];
-        iv.copy_from_slice(&self.salt[..12]);
+        iv.copy_from_slice(&self.rtp_keys.salt[..12]);
 
         let mut block = [0u8; 12];
         block[2..6].copy_from_slice(&self.ssrc.to_be_bytes());
@@ -490,7 +507,7 @@ impl SrtpContext {
     fn build_iv(&self, sequence: u16, roc: u32) -> [u8; 16] {
         let index = ((roc as u64) << 16) | sequence as u64;
         let mut iv = [0u8; 16];
-        for (i, byte) in self.salt.iter().enumerate().take(14) {
+        for (i, byte) in self.rtp_keys.salt.iter().enumerate().take(14) {
             iv[i] = *byte;
         }
         let mut block = [0u8; 16];
