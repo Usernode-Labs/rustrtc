@@ -85,13 +85,40 @@ The echo server example demonstrates how to accept a WebRTC connection, receive 
 
 2. Open your browser and navigate to `http://127.0.0.1:3000`.
 
-### RTP Example
+### DataChannel Chat
 
-The RTP example demonstrates how to create a PeerConnection, add an audio track, and send dummy audio frames.
+A multi-user chat room using WebRTC DataChannels.
 
-1. Run the example:
+1. Run the server:
     ```bash
-    cargo run --example rtp_example
+    cargo run --example datachannel_chat
+    ```
+
+2. Open your browser and navigate to `http://127.0.0.1:3000`. Open multiple tabs to chat between them.
+
+### Audio Saver
+
+Records audio from the browser's microphone and saves it to a file (`output.ulaw`) on the server.
+
+1. Run the server:
+    ```bash
+    cargo run --example audio_saver
+    ```
+
+2. Open your browser and navigate to `http://127.0.0.1:3000`. Click "Start" to begin recording.
+
+### RTP Play (FFmpeg)
+
+Streams a video file (`examples/static/output.ivf`) via RTP to a UDP port, which can be played back using `ffplay`.
+
+1. Run the server:
+    ```bash
+    cargo run --example rtp_play
+    ```
+
+2. In a separate terminal, run `ffplay` (requires ffmpeg installed):
+    ```bash
+    ffplay -protocol_whitelist file,udp,rtp -i examples/rtp_play.sdp
     ```
 
 ## License
