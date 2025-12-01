@@ -40,6 +40,7 @@ pub struct IceTransport {
 
 struct IceTransportInner {
     state: watch::Sender<IceTransportState>,
+    _state_rx_keeper: watch::Receiver<IceTransportState>,
     gathering_state: watch::Sender<IceGathererState>,
     role: std::sync::Mutex<IceRole>,
     selected_pair: std::sync::Mutex<Option<IceCandidatePair>>,
@@ -286,13 +287,14 @@ impl IceTransport {
         let (candidate_tx, _) = broadcast::channel(100);
         let (socket_tx, socket_rx) = tokio::sync::mpsc::unbounded_channel();
         let gatherer = IceGatherer::new(config.clone(), candidate_tx.clone(), socket_tx);
-        let (state_tx, _) = watch::channel(IceTransportState::New);
+        let (state_tx, state_rx) = watch::channel(IceTransportState::New);
         let (gathering_state_tx, _) = watch::channel(IceGathererState::New);
         let (selected_socket_tx, selected_socket_rx) = watch::channel(None);
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
 
         let inner = IceTransportInner {
             state: state_tx,
+            _state_rx_keeper: state_rx,
             gathering_state: gathering_state_tx,
             role: std::sync::Mutex::new(IceRole::Controlled),
             selected_pair: std::sync::Mutex::new(None),
