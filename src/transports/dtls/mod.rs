@@ -7,7 +7,7 @@ mod tests;
 
 use aes_gcm::{
     Aes128Gcm, Nonce,
-    aead::{Aead, KeyInit, Payload},
+    aead::{Aead, AeadInPlace, KeyInit, Payload},
 };
 use anyhow::Result;
 use bytes::{Buf, Bytes, BytesMut};
@@ -73,7 +73,7 @@ struct DtlsInner {
     state_tx: tokio::sync::watch::Sender<DtlsState>,
     state_rx: tokio::sync::watch::Receiver<DtlsState>,
     incoming_data_rx: Arc<Mutex<mpsc::Receiver<Vec<u8>>>>,
-    outgoing_data_tx: mpsc::Sender<Vec<u8>>,
+    outgoing_data_tx: mpsc::Sender<Bytes>,
     handshake_rx_feeder: mpsc::Sender<Vec<u8>>,
 }
 
@@ -170,10 +170,10 @@ impl DtlsTransport {
         self.close_tx.notify_waiters();
     }
 
-    pub async fn send(&self, data: &[u8]) -> Result<()> {
+    pub async fn send(&self, data: Bytes) -> Result<()> {
         self.inner
             .outgoing_data_tx
-            .send(data.to_vec())
+            .send(data)
             .await
             .map_err(|_| anyhow::anyhow!("Send failed"))
     }
@@ -1219,7 +1219,7 @@ impl DtlsInner {
         certificate: Certificate,
         is_client: bool,
         incoming_data_tx: mpsc::Sender<Vec<u8>>,
-        mut outgoing_data_rx: mpsc::Receiver<Vec<u8>>,
+        mut outgoing_data_rx: mpsc::Receiver<Bytes>,
         mut handshake_rx: mpsc::Receiver<Vec<u8>>,
         close_rx: Arc<tokio::sync::Notify>,
     ) -> Result<()> {
@@ -1597,19 +1597,15 @@ fn encrypt_record(
 
     let aad = make_aad(seq, content_type, version, payload.len());
 
-    let encrypted_payload = cipher
-        .encrypt(
-            nonce,
-            Payload {
-                msg: payload,
-                aad: &aad,
-            },
-        )
+    let mut result = Vec::with_capacity(8 + payload.len() + 16);
+    result.extend_from_slice(&nonce_bytes[4..12]);
+    result.extend_from_slice(payload);
+
+    let tag = cipher
+        .encrypt_in_place_detached(nonce, &aad, &mut result[8..])
         .map_err(|e| anyhow::anyhow!("Encryption failed: {}", e))?;
 
-    let mut result = Vec::new();
-    result.extend_from_slice(&nonce_bytes[4..12]);
-    result.extend_from_slice(&encrypted_payload);
+    result.extend_from_slice(&tag);
 
     Ok(result)
 }

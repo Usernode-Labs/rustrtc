@@ -58,6 +58,7 @@ struct IceTransportInner {
     last_received: Mutex<Instant>,
     candidate_tx: broadcast::Sender<IceCandidate>,
     cmd_tx: mpsc::UnboundedSender<IceCommand>,
+    checking_pairs: Mutex<std::collections::HashSet<(SocketAddr, SocketAddr)>>,
 }
 
 impl std::fmt::Debug for IceTransportInner {
@@ -95,7 +96,6 @@ impl IceTransportRunner {
         let mut interval = tokio::time::interval(Duration::from_secs(1));
         let mut read_futures: FuturesUnordered<BoxFuture<'static, ()>> = FuturesUnordered::new();
         let mut gathering_future: BoxFuture<'static, ()> = Box::pin(futures::future::pending());
-        let mut check_future: BoxFuture<'static, ()> = Box::pin(futures::future::pending());
 
         loop {
             tokio::select! {
@@ -113,7 +113,7 @@ impl IceTransportRunner {
                     match res {
                         Ok(_) => {
                              let inner = self.inner.clone();
-                             check_future = Box::pin(async move {
+                             tokio::spawn(async move {
                                  perform_connectivity_checks_async(inner).await;
                              });
                         }
@@ -140,7 +140,7 @@ impl IceTransportRunner {
                         }
                         IceCommand::RunChecks => {
                              let inner = self.inner.clone();
-                             check_future = Box::pin(async move {
+                             tokio::spawn(async move {
                                  perform_connectivity_checks_async(inner).await;
                              });
                         }
@@ -154,9 +154,6 @@ impl IceTransportRunner {
                 }
                 _ = &mut gathering_future => {
                     gathering_future = Box::pin(futures::future::pending());
-                }
-                _ = &mut check_future => {
-                    check_future = Box::pin(futures::future::pending());
                 }
             }
         }
@@ -311,6 +308,7 @@ impl IceTransport {
             last_received: Mutex::new(Instant::now()),
             candidate_tx: candidate_tx.clone(),
             cmd_tx,
+            checking_pairs: Mutex::new(std::collections::HashSet::new()),
         };
         let inner = Arc::new(inner);
 
@@ -552,15 +550,39 @@ async fn perform_connectivity_checks_async(inner: Arc<IceTransportInner>) {
     // Sort by priority
     pairs.sort_by(|a, b| b.priority(role).cmp(&a.priority(role)));
 
+    let mut pairs_to_check = Vec::new();
+    {
+        let mut checking = inner.checking_pairs.lock().await;
+        for pair in pairs {
+            let key = (pair.local.address, pair.remote.address);
+            if !checking.contains(&key) {
+                checking.insert(key);
+                pairs_to_check.push(pair);
+            }
+        }
+    }
+
+    if pairs_to_check.is_empty() {
+        return;
+    }
+
     let mut checks = futures::stream::FuturesUnordered::new();
 
-    for pair in pairs {
+    for pair in pairs_to_check {
         let inner = inner.clone();
         let local = pair.local.clone();
         let remote = pair.remote.clone();
 
         checks.push(async move {
-            match perform_binding_check(&local, &remote, &inner, role).await {
+            let key = (local.address, remote.address);
+            let res = perform_binding_check(&local, &remote, &inner, role).await;
+
+            {
+                let mut checking = inner.checking_pairs.lock().await;
+                checking.remove(&key);
+            }
+
+            match res {
                 Ok(_) => Some(IceCandidatePair::new(local, remote)),
                 Err(_) => None,
             }
@@ -586,7 +608,10 @@ async fn perform_connectivity_checks_async(inner: Arc<IceTransportInner>) {
     }
 
     if !success {
-        let _ = inner.state.send(IceTransportState::Failed);
+        let state = *inner.state.borrow();
+        if state != IceTransportState::Connected {
+            let _ = inner.state.send(IceTransportState::Failed);
+        }
     }
 }
 

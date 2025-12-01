@@ -1123,6 +1123,18 @@ impl PeerConnection {
         }
     }
 
+    pub async fn send_text(&self, channel_id: u16, data: impl AsRef<str>) -> RtcResult<()> {
+        let transport = self.inner.sctp_transport.lock().unwrap().clone();
+        if let Some(transport) = transport {
+            transport
+                .send_text(channel_id, data)
+                .await
+                .map_err(|e| RtcError::Internal(format!("SCTP send failed: {}", e)))
+        } else {
+            Err(RtcError::InvalidState("SCTP not connected".into()))
+        }
+    }
+
     pub async fn get_stats(&self) -> RtcResult<StatsReport> {
         gather_once(&[self.inner.stats_collector.clone()]).await
     }

@@ -11,6 +11,30 @@ A pure Rust implementation of WebRTC.
 - **DTLS**: Datagram Transport Layer Security for secure communication.
 - **SDP**: Session Description Protocol parsing and generation.
 
+## Performance (vs webrtc.rs)
+> From Apple M4 machine result
+
+```shell
+mpi@mpis-MacBook-Air rustrtc % cargo build --release --example benchmark && ./target/release/examples/benchmark
+
+Comparison (Baseline: webrtc.rs)
+Metric               | webrtc.rs       | rustrtc         | Diff            | Diff %         
+------------------------------------------------------------------------------------------
+Duration (s)         | 10.02           | 10.01           |    -0.01        |    -0.10%      
+Latency (ms)         | 3.30            | 3.00            |    -0.30        |    -9.09%      
+Throughput (MB/s)    | 138.31          | 171.87          |   +33.56        |   +24.26%      
+Msg Rate (msg/s)     | 141633.13       | 175996.60       | +34363.47       |   +24.26%      
+CPU Usage (%)        | 847.72          | 844.07          |    -3.65        |    -0.43%      
+Memory (MB)          | 27.00           | 11.00           |   -16.00        |   -59.26%      
+------------------------------------------------------------------------------------------
+```
+
+**Key Findings:**
+- **Throughput**: `rustrtc` is ~24% faster than `webrtc.rs`.
+- **Memory**: `rustrtc` uses ~60% less memory.
+- **Latency**: Slightly improved (-9%).
+
+
 ## Usage
 
 Here is a simple example of how to create a `PeerConnection` and handle an offer:

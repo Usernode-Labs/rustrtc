@@ -6,7 +6,7 @@ use bytes::Bytes;
 use std::net::SocketAddr;
 use std::sync::{Arc, Weak};
 use tokio::sync::{RwLock, watch};
-use tracing::{debug, warn};
+use tracing::debug;
 
 pub struct IceConn {
     pub socket_rx: watch::Receiver<Option<IceSocketWrapper>>,
@@ -144,7 +144,7 @@ impl PacketReceiver for IceConn {
                     strong_rx.receive(packet, addr).await;
                 }
             } else {
-                warn!("IceConn: Received DTLS packet but no receiver registered");
+                debug!("IceConn: Received DTLS packet but no receiver registered");
             }
         } else if (128..192).contains(&first_byte) {
             // RTP / RTCP

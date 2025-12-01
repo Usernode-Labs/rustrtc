@@ -94,7 +94,7 @@ async fn test_interop_rustrtc_client_webrtc_server() -> Result<()> {
     // Send data
     let msg = b"hello world";
     info!("rustrtc client sending: {:?}", String::from_utf8_lossy(msg));
-    client_dtls.send(msg).await?;
+    client_dtls.send(Bytes::from_static(msg)).await?;
 
     // Receive echo
     info!("rustrtc client waiting for echo...");

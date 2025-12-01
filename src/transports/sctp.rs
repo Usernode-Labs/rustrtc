@@ -8,6 +8,7 @@ use tracing::{debug, trace, warn};
 
 // DCEP Constants
 const DATA_CHANNEL_PPID_DCEP: u32 = 50;
+const DATA_CHANNEL_PPID_STRING: u32 = 51;
 const DATA_CHANNEL_PPID_BINARY: u32 = 53;
 
 const DCEP_TYPE_OPEN: u8 = 0x03;
@@ -174,6 +175,29 @@ struct SctpInner {
     new_data_channel_tx: Option<mpsc::UnboundedSender<Arc<DataChannel>>>,
 }
 
+struct SctpCleanupGuard<'a> {
+    inner: &'a SctpInner,
+}
+
+impl<'a> Drop for SctpCleanupGuard<'a> {
+    fn drop(&mut self) {
+        *self.inner.state.lock().unwrap() = SctpState::Closed;
+
+        let channels = self.inner.data_channels.lock().unwrap();
+        for weak_dc in channels.iter() {
+            if let Some(dc) = weak_dc.upgrade() {
+                let mut state = dc.state.lock().unwrap();
+                if *state != DataChannelState::Closed {
+                    *state = DataChannelState::Closed;
+                    drop(state);
+                    dc.send_event(DataChannelEvent::Close);
+                    dc.close_channel();
+                }
+            }
+        }
+    }
+}
+
 pub struct SctpTransport {
     inner: Arc<SctpInner>,
     close_tx: Arc<tokio::sync::Notify>,
@@ -254,6 +278,10 @@ impl SctpTransport {
         self.inner.send_data(channel_id, data).await
     }
 
+    pub async fn send_text(&self, channel_id: u16, data: impl AsRef<str>) -> Result<()> {
+        self.inner.send_text(channel_id, data).await
+    }
+
     pub async fn send_dcep_open(&self, dc: &DataChannel) -> Result<()> {
         self.inner.send_dcep_open(dc).await
     }
@@ -268,6 +296,10 @@ impl Drop for SctpTransport {
 impl SctpInner {
     async fn run_loop(&self, close_rx: Arc<tokio::sync::Notify>) {
         *self.state.lock().unwrap() = SctpState::Connecting;
+
+        // Guard to ensure cleanup happens on drop (cancellation)
+        let _guard = SctpCleanupGuard { inner: self };
+
         loop {
             tokio::select! {
                 _ = close_rx.notified() => break,
@@ -283,21 +315,6 @@ impl SctpInner {
                             break;
                         }
                     }
-                }
-            }
-        }
-
-        *self.state.lock().unwrap() = SctpState::Closed;
-
-        let channels = self.data_channels.lock().unwrap();
-        for weak_dc in channels.iter() {
-            if let Some(dc) = weak_dc.upgrade() {
-                let mut state = dc.state.lock().unwrap();
-                if *state != DataChannelState::Closed {
-                    *state = DataChannelState::Closed;
-                    drop(state);
-                    dc.send_event(DataChannelEvent::Close);
-                    dc.close_channel();
                 }
             }
         }
@@ -616,20 +633,28 @@ impl SctpInner {
         // Calculate Checksum (CRC32c)
         let checksum = crc32c::crc32c(&packet);
 
-        let mut packet_bytes = packet.to_vec();
         let checksum_bytes = checksum.to_le_bytes();
 
-        packet_bytes[8] = checksum_bytes[0];
-        packet_bytes[9] = checksum_bytes[1];
-        packet_bytes[10] = checksum_bytes[2];
-        packet_bytes[11] = checksum_bytes[3];
+        packet[8] = checksum_bytes[0];
+        packet[9] = checksum_bytes[1];
+        packet[10] = checksum_bytes[2];
+        packet[11] = checksum_bytes[3];
 
-        self.dtls_transport.send(&packet_bytes).await
+        self.dtls_transport.send(packet.freeze()).await
     }
 
     pub async fn send_data(&self, channel_id: u16, data: &[u8]) -> Result<()> {
         self.send_data_raw(channel_id, DATA_CHANNEL_PPID_BINARY, data)
             .await
+    }
+
+    pub async fn send_text(&self, channel_id: u16, data: impl AsRef<str>) -> Result<()> {
+        self.send_data_raw(
+            channel_id,
+            DATA_CHANNEL_PPID_STRING,
+            data.as_ref().as_bytes(),
+        )
+        .await
     }
 
     pub async fn send_data_raw(&self, channel_id: u16, ppid: u32, data: &[u8]) -> Result<()> {

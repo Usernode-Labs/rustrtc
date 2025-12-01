@@ -118,7 +118,7 @@ async fn offer(
         let sender_task = tokio::spawn(async move {
             while let Ok(msg) = rx.recv().await {
                 if msg.sender_id != my_id {
-                    if let Err(e) = pc_sender.send_data(0, msg.text.as_bytes()).await {
+                    if let Err(e) = pc_sender.send_text(0, msg.text).await {
                         warn!("Failed to send data to client {}: {}", my_id, e);
                         break;
                     }
