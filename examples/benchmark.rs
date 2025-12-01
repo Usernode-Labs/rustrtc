@@ -77,8 +77,10 @@ async fn main() {
         println!("No arguments provided. Running comparison mode (count=10).");
         
         let exe = env::current_exe().expect("Failed to get current executable path");
-        
+        let mut results = Vec::new();
+
         // Run webrtc in subprocess
+        println!("\nRunning webrtc benchmark...");
         let webrtc_output = Command::new(&exe)
             .arg("webrtc")
             .arg("10")
@@ -86,14 +88,16 @@ async fn main() {
             .expect("Failed to run webrtc benchmark");
             
         let webrtc_stdout = String::from_utf8_lossy(&webrtc_output.stdout);
-        // Print stdout to see progress if needed, or just parse it
         println!("{}", webrtc_stdout);
-        let webrtc_res = parse_output(&webrtc_stdout, "webrtc").expect("Failed to parse webrtc results");
+        if let Some(res) = parse_output(&webrtc_stdout, "webrtc") {
+            results.push(res);
+        }
         
-        println!("\nPausing for 2 seconds...");
-        sleep(Duration::from_secs(2)).await;
+        println!("\nPausing for 3 seconds...");
+        sleep(Duration::from_secs(3)).await;
         
         // Run rustrtc in subprocess
+        println!("\nRunning rustrtc benchmark...");
         let rustrtc_output = Command::new(&exe)
             .arg("rustrtc")
             .arg("10")
@@ -102,9 +106,39 @@ async fn main() {
             
         let rustrtc_stdout = String::from_utf8_lossy(&rustrtc_output.stdout);
         println!("{}", rustrtc_stdout);
-        let rustrtc_res = parse_output(&rustrtc_stdout, "rustrtc").expect("Failed to parse rustrtc results");
+        if let Some(res) = parse_output(&rustrtc_stdout, "rustrtc") {
+            results.push(res);
+        }
+
+        // Check for Go and run Pion benchmark
+        if check_go_installed() {
+            println!("\nGo compiler found. Building and running Pion benchmark...");
+            if let Some(pion_exe) = build_go_benchmark() {
+                println!("\nPausing for 3 seconds...");
+                sleep(Duration::from_secs(3)).await;
+                println!("\nRunning Pion benchmark...");
+                let pion_output = Command::new(&pion_exe)
+                    .arg("10")
+                    .output()
+                    .expect("Failed to run Pion benchmark");
+                
+                let pion_stdout = String::from_utf8_lossy(&pion_output.stdout);
+                println!("{}", pion_stdout);
+                if let Some(res) = parse_output(&pion_stdout, "pion") {
+                    results.push(res);
+                }
+                
+                // Cleanup
+                let _ = std::fs::remove_file(pion_exe);
+            }
+        } else {
+            println!("\nGo compiler not found. Skipping Pion benchmark.");
+        }
         
-        print_diff_table(&webrtc_res, &rustrtc_res);
+        if !results.is_empty() {
+            print_comparison_table(&results);
+            print_bar_charts(&results);
+        }
     } else {
         let mode = args.get(1).map(|s| s.as_str()).unwrap();
         let count = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(100);
@@ -261,29 +295,112 @@ fn start_resource_monitor() -> (Arc<AtomicU64>, Arc<AtomicU64>, Arc<AtomicU64>, 
     (peak_rss, avg_cpu, cpu_samples, running)
 }
 
-fn print_diff_table(base: &BenchResult, target: &BenchResult) {
-    println!("\nComparison (Baseline: {})", base.mode);
-    println!("{:<20} | {:<15} | {:<15} | {:<15} | {:<15}", "Metric", base.mode, target.mode, "Diff", "Diff %");
-    println!("{:-<90}", "");
-    
-    print_row("Duration (s)", base.duration.as_secs_f64(), target.duration.as_secs_f64());
-    print_row("Latency (ms)", base.latency, target.latency);
-    print_row("Throughput (MB/s)", base.throughput(), target.throughput());
-    print_row("Msg Rate (msg/s)", base.msg_rate(), target.msg_rate());
-    print_row("CPU Usage (%)", base.cpu_usage, target.cpu_usage);
-    print_row("Memory (MB)", base.memory_rss as f64, target.memory_rss as f64);
-    println!("{:-<90}", "");
+fn check_go_installed() -> bool {
+    Command::new("go")
+        .arg("version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
 }
 
-fn print_row(name: &str, v1: f64, v2: f64) {
-    let diff = v2 - v1;
-    let diff_percent = if v1 != 0.0 { (diff / v1) * 100.0 } else { 0.0 };
+fn build_go_benchmark() -> Option<String> {
+    let manifest_dir = env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".to_string());
+    let go_bench_dir = std::path::Path::new(&manifest_dir).join("examples/go_bench");
+    let output_exe = std::path::Path::new(&manifest_dir).join("benchmark_go");
     
-    let diff_str = format!("{:+8.2}", diff);
-    let percent_str = format!("{:+8.2}%", diff_percent);
-    
-    println!("{:<20} | {:<15.2} | {:<15.2} | {:<15} | {:<15}", name, v1, v2, diff_str, percent_str);
+    let status = Command::new("go")
+        .arg("build")
+        .arg("-o")
+        .arg(&output_exe)
+        .current_dir(&go_bench_dir)
+        .status()
+        .ok()?;
+
+    if status.success() {
+        Some(output_exe.to_string_lossy().to_string())
+    } else {
+        None
+    }
 }
+
+fn print_comparison_table(results: &[BenchResult]) {
+    if results.is_empty() {
+        return;
+    }
+    
+    // Find baseline (webrtc)
+    let baseline = results.iter().find(|r| r.mode == "webrtc").unwrap_or(&results[0]);
+    
+    println!("\nComparison (Baseline: {})", baseline.mode);
+    
+    // Header
+    print!("{:<20}", "Metric");
+    for res in results {
+        print!(" | {:<10}", res.mode);
+    }
+    println!();
+    println!("{:-<80}", "");
+    
+    let metrics = [
+        ("Duration (s)", Box::new(|r: &BenchResult| r.duration.as_secs_f64()) as Box<dyn Fn(&BenchResult) -> f64>),
+        ("Latency (ms)", Box::new(|r: &BenchResult| r.latency)),
+        ("Throughput (MB/s)", Box::new(|r: &BenchResult| r.throughput())),
+        ("Msg Rate (msg/s)", Box::new(|r: &BenchResult| r.msg_rate())),
+        ("CPU Usage (%)", Box::new(|r: &BenchResult| r.cpu_usage)),
+        ("Memory (MB)", Box::new(|r: &BenchResult| r.memory_rss as f64)),
+    ];
+
+    for (name, getter) in metrics.iter() {
+        print!("{:<20}", name);
+        for res in results {
+            let val = getter(res);
+            print!(" | {:<10.2}", val);
+        }
+        println!();
+    }
+    println!("{:-<80}", "");
+}
+
+fn print_bar_charts(results: &[BenchResult]) {
+    println!("\nPerformance Charts");
+    println!("==================");
+    
+    let metrics = [
+        ("Throughput (MB/s)", true, Box::new(|r: &BenchResult| r.throughput()) as Box<dyn Fn(&BenchResult) -> f64>),
+        ("Message Rate (msg/s)", true, Box::new(|r: &BenchResult| r.msg_rate())),
+        ("Latency (ms)", false, Box::new(|r: &BenchResult| r.latency)),
+        ("CPU Usage (%)", false, Box::new(|r: &BenchResult| r.cpu_usage)),
+        ("Memory (MB)", false, Box::new(|r: &BenchResult| r.memory_rss as f64)),
+    ];
+
+    for (name, higher_is_better, getter) in metrics.iter() {
+        let remark = if *higher_is_better { "Higher is better" } else { "Lower is better" };
+        println!("\n{} ({})", name, remark);
+        let max_val = results.iter().map(|r| getter(r)).fold(0.0, f64::max);
+        
+        for res in results {
+            let val = getter(res);
+            let bar_len = if max_val > 0.0 {
+                (val / max_val * 40.0) as usize
+            } else {
+                0
+            };
+            
+            let color = match res.mode.as_str() {
+                "rustrtc" => "\x1b[32m", // Green
+                "webrtc" => "\x1b[34m",  // Blue
+                "pion" => "\x1b[36m",    // Cyan
+                _ => "\x1b[0m",
+            };
+            let reset = "\x1b[0m";
+
+            let bar: String = std::iter::repeat("█").take(bar_len).collect();
+            println!("{:<10} | {}{:<40}{} {:.2}", res.mode, color, bar, reset, val);
+        }
+    }
+    println!();
+}
+
 
 
 async fn run_rustrtc(count: usize) -> (f64, u64, u64) {

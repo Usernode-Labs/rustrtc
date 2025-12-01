@@ -41,21 +41,21 @@ pub struct IceTransport {
 struct IceTransportInner {
     state: watch::Sender<IceTransportState>,
     gathering_state: watch::Sender<IceGathererState>,
-    role: Mutex<IceRole>,
-    selected_pair: Mutex<Option<IceCandidatePair>>,
+    role: std::sync::Mutex<IceRole>,
+    selected_pair: std::sync::Mutex<Option<IceCandidatePair>>,
     local_candidates: Mutex<Vec<IceCandidate>>,
-    remote_candidates: Mutex<Vec<IceCandidate>>,
+    remote_candidates: std::sync::Mutex<Vec<IceCandidate>>,
     gather_state: Mutex<IceGathererState>,
     config: RtcConfiguration,
     gatherer: IceGatherer,
-    local_parameters: Mutex<IceParameters>,
-    remote_parameters: Mutex<Option<IceParameters>>,
-    pending_transactions: Mutex<HashMap<[u8; 12], oneshot::Sender<StunDecoded>>>,
+    local_parameters: std::sync::Mutex<IceParameters>,
+    remote_parameters: std::sync::Mutex<Option<IceParameters>>,
+    pending_transactions: std::sync::Mutex<HashMap<[u8; 12], oneshot::Sender<StunDecoded>>>,
     data_receiver: Mutex<Option<Arc<dyn PacketReceiver>>>,
     buffered_packets: Mutex<Vec<(Vec<u8>, SocketAddr)>>,
     selected_socket: watch::Sender<Option<IceSocketWrapper>>,
     _socket_rx_keeper: watch::Receiver<Option<IceSocketWrapper>>,
-    last_received: Mutex<Instant>,
+    last_received: std::sync::Mutex<Instant>,
     candidate_tx: broadcast::Sender<IceCandidate>,
     cmd_tx: mpsc::UnboundedSender<IceCommand>,
     checking_pairs: Mutex<std::collections::HashSet<(SocketAddr, SocketAddr)>>,
@@ -235,8 +235,7 @@ impl IceTransportRunner {
     async fn run_keepalive_tick(inner: &Arc<IceTransportInner>) {
         let state = *inner.state.borrow();
         if state == IceTransportState::Connected || state == IceTransportState::Disconnected {
-            let last = *inner.last_received.lock().await;
-            let elapsed = last.elapsed();
+            let elapsed = inner.last_received.lock().unwrap().elapsed();
             if elapsed > Duration::from_secs(30) {
                 let _ = inner.state.send(IceTransportState::Failed);
             } else if elapsed > Duration::from_secs(5) {
@@ -248,17 +247,18 @@ impl IceTransportRunner {
             }
 
             // Send Keepalive
-            if let Some(pair) = inner.selected_pair.lock().await.clone() {
+            let pair_opt = inner.selected_pair.lock().unwrap().clone();
+            if let Some(pair) = pair_opt {
                 if let Some(socket) = resolve_socket(inner, &pair).await {
                     let tx_id = random_bytes::<12>();
                     let mut msg = StunMessage::binding_request(tx_id, Some("rustrtc"));
 
-                    let remote_params = inner.remote_parameters.lock().await.clone();
+                    let remote_params = inner.remote_parameters.lock().unwrap().clone();
                     if let Some(params) = remote_params {
                         let username = format!(
                             "{}:{}",
                             params.username_fragment,
-                            inner.local_parameters.lock().await.username_fragment
+                            inner.local_parameters.lock().unwrap().username_fragment
                         );
                         msg.attributes.push(StunAttribute::Username(username));
                         msg.attributes
@@ -291,21 +291,21 @@ impl IceTransport {
         let inner = IceTransportInner {
             state: state_tx,
             gathering_state: gathering_state_tx,
-            role: Mutex::new(IceRole::Controlled),
-            selected_pair: Mutex::new(None),
+            role: std::sync::Mutex::new(IceRole::Controlled),
+            selected_pair: std::sync::Mutex::new(None),
             local_candidates: Mutex::new(Vec::new()),
-            remote_candidates: Mutex::new(Vec::new()),
+            remote_candidates: std::sync::Mutex::new(Vec::new()),
             gather_state: Mutex::new(IceGathererState::New),
             config,
             gatherer,
-            local_parameters: Mutex::new(IceParameters::generate()),
-            remote_parameters: Mutex::new(None),
-            pending_transactions: Mutex::new(HashMap::new()),
+            local_parameters: std::sync::Mutex::new(IceParameters::generate()),
+            remote_parameters: std::sync::Mutex::new(None),
+            pending_transactions: std::sync::Mutex::new(HashMap::new()),
             data_receiver: Mutex::new(None),
             buffered_packets: Mutex::new(Vec::new()),
             selected_socket: selected_socket_tx,
             _socket_rx_keeper: selected_socket_rx,
-            last_received: Mutex::new(Instant::now()),
+            last_received: std::sync::Mutex::new(Instant::now()),
             candidate_tx: candidate_tx.clone(),
             cmd_tx,
             checking_pairs: Mutex::new(std::collections::HashSet::new()),
@@ -347,7 +347,7 @@ impl IceTransport {
     }
 
     pub async fn role(&self) -> IceRole {
-        *self.inner.role.lock().await
+        *self.inner.role.lock().unwrap()
     }
 
     pub async fn local_candidates(&self) -> Vec<IceCandidate> {
@@ -355,11 +355,11 @@ impl IceTransport {
     }
 
     pub async fn remote_candidates(&self) -> Vec<IceCandidate> {
-        self.inner.remote_candidates.lock().await.clone()
+        self.inner.remote_candidates.lock().unwrap().clone()
     }
 
     pub async fn local_parameters(&self) -> IceParameters {
-        self.inner.local_parameters.lock().await.clone()
+        self.inner.local_parameters.lock().unwrap().clone()
     }
 
     fn start_keepalive(&self) {
@@ -384,7 +384,7 @@ impl IceTransport {
         self.start_gathering().await?;
         self.start_keepalive();
         {
-            let mut params = self.inner.remote_parameters.lock().await;
+            let mut params = self.inner.remote_parameters.lock().unwrap();
             *params = Some(remote);
         }
         if let Err(e) = self.inner.state.send(IceTransportState::Checking) {
@@ -413,7 +413,7 @@ impl IceTransport {
         let remote = IceCandidate::host(remote_addr, 1);
         let pair = IceCandidatePair::new(local, remote);
 
-        *self.inner.selected_pair.lock().await = Some(pair.clone());
+        *self.inner.selected_pair.lock().unwrap() = Some(pair.clone());
         if let Some(socket) = resolve_socket(&self.inner, &pair).await {
             let _ = self.inner.selected_socket.send(Some(socket));
         }
@@ -426,18 +426,18 @@ impl IceTransport {
     }
 
     pub async fn set_role(&self, role: IceRole) {
-        *self.inner.role.lock().await = role;
+        *self.inner.role.lock().unwrap() = role;
     }
 
     pub async fn add_remote_candidate(&self, candidate: IceCandidate) {
-        let mut list = self.inner.remote_candidates.lock().await;
+        let mut list = self.inner.remote_candidates.lock().unwrap();
         list.push(candidate);
         drop(list);
         self.try_connectivity_checks();
     }
 
     pub async fn select_pair(&self, pair: IceCandidatePair) {
-        *self.inner.selected_pair.lock().await = Some(pair.clone());
+        *self.inner.selected_pair.lock().unwrap() = Some(pair.clone());
         if let Some(socket) = resolve_socket(&self.inner, &pair).await {
             let _ = self.inner.selected_socket.send(Some(socket));
         }
@@ -449,7 +449,7 @@ impl IceTransport {
     }
 
     pub async fn get_selected_socket(&self) -> Option<IceSocketWrapper> {
-        let pair = self.inner.selected_pair.lock().await.clone()?;
+        let pair = self.inner.selected_pair.lock().unwrap().clone()?;
         if pair.local.typ == IceCandidateType::Relay {
             let clients = self.inner.gatherer.turn_clients.lock().await;
             clients
@@ -465,7 +465,7 @@ impl IceTransport {
     }
 
     pub async fn get_selected_pair(&self) -> Option<IceCandidatePair> {
-        self.inner.selected_pair.lock().await.clone()
+        self.inner.selected_pair.lock().unwrap().clone()
     }
 
     pub async fn set_data_receiver(&self, receiver: Arc<dyn PacketReceiver>) {
@@ -525,8 +525,8 @@ async fn perform_connectivity_checks_async(inner: Arc<IceTransportInner>) {
         return;
     }
     let locals = inner.gatherer.local_candidates().await;
-    let remotes = inner.remote_candidates.lock().await.clone();
-    let role = *inner.role.lock().await;
+    let remotes = inner.remote_candidates.lock().unwrap().clone();
+    let role = *inner.role.lock().unwrap();
 
     if locals.is_empty() || remotes.is_empty() {
         return;
@@ -597,7 +597,7 @@ async fn perform_connectivity_checks_async(inner: Arc<IceTransportInner>) {
     let mut success = false;
     while let Some(res) = checks.next().await {
         if let Some(pair) = res {
-            *inner.selected_pair.lock().await = Some(pair.clone());
+            *inner.selected_pair.lock().unwrap() = Some(pair.clone());
             if let Some(socket) = resolve_socket(&inner, &pair).await {
                 let _ = inner.selected_socket.send(Some(socket));
             }
@@ -643,8 +643,7 @@ async fn handle_packet(
     sender: IceSocketWrapper,
 ) {
     {
-        let mut last = inner.last_received.lock().await;
-        *last = Instant::now();
+        *inner.last_received.lock().unwrap() = Instant::now();
     }
     let b = packet[0];
     if b < 2 {
@@ -654,7 +653,7 @@ async fn handle_packet(
                 if msg.class == StunClass::Request {
                     handle_stun_request(&sender, &msg, addr, inner).await;
                 } else if msg.class == StunClass::SuccessResponse {
-                    let mut map = inner.pending_transactions.lock().await;
+                    let mut map = inner.pending_transactions.lock().unwrap();
                     if let Some(tx) = map.remove(&msg.transaction_id) {
                         let _ = tx.send(msg);
                     } else {
@@ -703,8 +702,7 @@ async fn handle_stun_request(
 ) {
     let response = StunMessage::binding_success_response(msg.transaction_id, addr);
 
-    let local_params = inner.local_parameters.lock().await;
-    let password = &local_params.password;
+    let password = inner.local_parameters.lock().unwrap().password.clone();
     if let Ok(bytes) = response.encode(Some(password.as_bytes()), true) {
         match sender.send_to(&bytes, addr).await {
             Ok(_) => trace!("Sent STUN Response to {}", addr),
@@ -717,7 +715,7 @@ async fn handle_stun_request(
     // Check if we know this candidate
     let mut known = false;
     {
-        let remotes = inner.remote_candidates.lock().await;
+        let remotes = inner.remote_candidates.lock().unwrap();
         for cand in remotes.iter() {
             if cand.address == addr {
                 known = true;
@@ -733,7 +731,7 @@ async fn handle_stun_request(
         candidate.foundation = "prflx".to_string();
         candidate.priority = IceCandidate::priority_for(IceCandidateType::PeerReflexive, 1);
 
-        let mut list = inner.remote_candidates.lock().await;
+        let mut list = inner.remote_candidates.lock().unwrap();
         list.push(candidate);
         drop(list);
 
@@ -741,7 +739,7 @@ async fn handle_stun_request(
     }
 
     if msg.use_candidate {
-        let role = *inner.role.lock().await;
+        let role = *inner.role.lock().unwrap();
         if role == IceRole::Controlled {
             let local_addr = match sender {
                 IceSocketWrapper::Udp(s) => s
@@ -753,16 +751,22 @@ async fn handle_stun_request(
             let locals = inner.gatherer.local_candidates().await;
             let local_cand = locals.iter().find(|c| c.address == local_addr);
 
-            let remotes = inner.remote_candidates.lock().await;
-            let remote_cand = remotes.iter().find(|c| c.address == addr);
+            let pair = {
+                let remotes = inner.remote_candidates.lock().unwrap();
+                let remote_cand = remotes.iter().find(|c| c.address == addr);
+                if let (Some(l), Some(r)) = (local_cand, remote_cand) {
+                    Some(IceCandidatePair::new(l.clone(), r.clone()))
+                } else {
+                    None
+                }
+            };
 
-            if let (Some(l), Some(r)) = (local_cand, remote_cand) {
-                let pair = IceCandidatePair::new(l.clone(), r.clone());
+            if let Some(pair) = pair {
                 trace!(
                     "Controlled agent selected pair via UseCandidate: {} -> {}",
-                    l.address, r.address
+                    pair.local.address, pair.remote.address
                 );
-                *inner.selected_pair.lock().await = Some(pair.clone());
+                *inner.selected_pair.lock().unwrap() = Some(pair.clone());
                 if let Some(socket) = resolve_socket(&inner, &pair).await {
                     let _ = inner.selected_socket.send(Some(socket));
                 }
@@ -786,8 +790,8 @@ async fn perform_binding_check(
     if remote.transport != "udp" {
         bail!("only UDP connectivity checks are supported");
     }
-    let local_params = inner.local_parameters.lock().await.clone();
-    let remote_params = match inner.remote_parameters.lock().await.clone() {
+    let local_params = inner.local_parameters.lock().unwrap().clone();
+    let remote_params = match inner.remote_parameters.lock().unwrap().clone() {
         Some(p) => p,
         None => bail!("no remote params"),
     };
@@ -814,7 +818,7 @@ async fn perform_binding_check(
 
     let (tx, rx) = oneshot::channel();
     {
-        let mut map = inner.pending_transactions.lock().await;
+        let mut map = inner.pending_transactions.lock().unwrap();
         map.insert(tx_id, tx);
     }
 
@@ -829,7 +833,7 @@ async fn perform_binding_check(
 
             let (perm_tx, perm_rx) = oneshot::channel();
             {
-                let mut map = inner.pending_transactions.lock().await;
+                let mut map = inner.pending_transactions.lock().unwrap();
                 map.insert(perm_tx_id, perm_tx);
             }
 
@@ -843,7 +847,7 @@ async fn perform_binding_check(
                     }
                 }
                 _ => {
-                    let mut map = inner.pending_transactions.lock().await;
+                    let mut map = inner.pending_transactions.lock().unwrap();
                     map.remove(&perm_tx_id);
                     bail!("CreatePermission timeout");
                 }
@@ -872,7 +876,7 @@ async fn perform_binding_check(
         Ok(Ok(msg)) => msg,
         Ok(Err(_)) => bail!("channel closed"),
         Err(_) => {
-            let mut map = inner.pending_transactions.lock().await;
+            let mut map = inner.pending_transactions.lock().unwrap();
             map.remove(&tx_id);
             bail!("timeout");
         }

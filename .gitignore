@@ -1,3 +1,5 @@
 Cargo.lock
 target/
 output.ulaw
+examples/go_bench/benchmark
+go.sum
