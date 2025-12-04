@@ -109,7 +109,6 @@ impl RtpTransport {
 #[async_trait]
 impl PacketReceiver for RtpTransport {
     async fn receive(&self, packet: Bytes, _addr: SocketAddr) {
-        println!("RtpTransport received {} bytes", packet.len());
         let is_rtcp_packet = is_rtcp(&packet);
 
         let unprotected = {
@@ -121,7 +120,6 @@ impl PacketReceiver for RtpTransport {
                     match srtp.unprotect_rtcp(&mut buf) {
                         Ok(_) => buf,
                         Err(e) => {
-                            println!("SRTP unprotect RTCP failed: {}", e);
                             tracing::warn!("SRTP unprotect RTCP failed: {}", e);
                             return;
                         }
@@ -132,19 +130,16 @@ impl PacketReceiver for RtpTransport {
                             Ok(_) => match rtp_packet.marshal() {
                                 Ok(b) => b,
                                 Err(e) => {
-                                    println!("RTP marshal failed: {}", e);
                                     tracing::warn!("RTP marshal failed: {}", e);
                                     return;
                                 }
                             },
                             Err(e) => {
-                                println!("SRTP unprotect RTP failed: {}", e);
                                 tracing::warn!("SRTP unprotect RTP failed: {}", e);
                                 return;
                             }
                         },
                         Err(e) => {
-                            println!("RTP parse failed: {}", e);
                             tracing::warn!("RTP parse failed: {}", e);
                             return;
                         }
@@ -163,9 +158,6 @@ impl PacketReceiver for RtpTransport {
             if let Some(tx) = listener {
                 match parse_rtcp_packets(&unprotected) {
                     Ok(packets) => {
-                        for p in &packets {
-                            println!("Received RTCP Packet: {:?}", p);
-                        }
                         if tx.send(packets).await.is_err() {
                             let mut guard = self.rtcp_listener.lock().unwrap();
                             *guard = None;
@@ -215,6 +207,12 @@ impl PacketReceiver for RtpTransport {
                             let mut listeners = self.listeners.lock().unwrap();
                             listeners.remove(&ssrc);
                         }
+                    } else {
+                        tracing::warn!(
+                            "No listener found for packet SSRC: {} PT: {}",
+                            ssrc,
+                            rtp_packet.header.payload_type
+                        );
                     }
                 }
                 Err(e) => {

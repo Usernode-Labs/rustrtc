@@ -334,10 +334,10 @@ impl SrtpContext {
                 .as_ref()
                 .ok_or(SrtpError::UnsupportedProfile)?;
 
-            // AAD = Header (8 bytes) || Index (4 bytes, WITHOUT E-bit)
+            // AAD = Header (8 bytes) || Index (4 bytes, WITH E-bit)
             let mut aad = Vec::with_capacity(12);
             aad.extend_from_slice(&packet[..8]);
-            aad.extend_from_slice(&index.to_be_bytes());
+            aad.extend_from_slice(&index_with_e.to_be_bytes());
 
             // Payload = Packet body (after header)
             let payload_data = &packet[8..];
@@ -355,7 +355,7 @@ impl SrtpContext {
             packet.truncate(8);
             packet.extend_from_slice(&ciphertext);
             packet.extend_from_slice(&index_with_e.to_be_bytes());
-            
+
             return Ok(());
         }
 
@@ -403,10 +403,10 @@ impl SrtpContext {
                 .as_ref()
                 .ok_or(SrtpError::UnsupportedProfile)?;
 
-            // AAD = Header (8 bytes) || Index (4 bytes, WITHOUT E-bit)
+            // AAD = Header (8 bytes) || Index (4 bytes, WITH E-bit)
             let mut aad = Vec::with_capacity(12);
             aad.extend_from_slice(&packet[..8]);
-            aad.extend_from_slice(&index.to_be_bytes());
+            aad.extend_from_slice(&index_with_e.to_be_bytes());
 
             // Ciphertext = Packet body (after header, before index)
             // Note: Tag is appended to ciphertext in GCM encrypt output.
@@ -425,7 +425,7 @@ impl SrtpContext {
             // Reconstruct packet: Header || Plaintext
             packet.truncate(8);
             packet.extend_from_slice(&plaintext);
-            
+
             return Ok(());
         }
 
@@ -627,7 +627,7 @@ impl SrtpContext {
 
         let mut block = [0u8; 12];
         block[2..6].copy_from_slice(&self.ssrc.to_be_bytes());
-        block[6..10].copy_from_slice(&index.to_be_bytes());
+        block[8..12].copy_from_slice(&index.to_be_bytes());
 
         for i in 0..12 {
             iv[i] ^= block[i];

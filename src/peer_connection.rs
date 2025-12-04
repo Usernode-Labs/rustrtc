@@ -1,5 +1,5 @@
 use crate::media::track::{MediaStreamTrack, SampleStreamSource, SampleStreamTrack, sample_track};
-use crate::rtp::{FirRequest, FullIntraRequest, PictureLossIndication, RtcpPacket};
+use crate::rtp::{FirRequest, FullIntraRequest, PictureLossIndication, RtcpPacket, RtpPacket};
 use crate::stats::{StatsReport, gather_once};
 use crate::stats_collector::StatsCollector;
 use crate::transports::dtls::{self, DtlsTransport};
@@ -526,6 +526,7 @@ impl PeerConnection {
 
                 for attr in &section.attributes {
                     if attr.key == "ssrc"
+                        && ssrc.is_none()
                         && let Some(val) = &attr.value
                         && let Some(ssrc_str) = val.split_whitespace().next()
                         && let Ok(parsed) = ssrc_str.parse::<u32>()
@@ -609,6 +610,7 @@ impl PeerConnection {
                     let mut ssrc = None;
                     for attr in &section.attributes {
                         if attr.key == "ssrc"
+                            && ssrc.is_none()
                             && let Some(val) = &attr.value
                             && let Some(ssrc_str) = val.split_whitespace().next()
                             && let Ok(parsed) = ssrc_str.parse::<u32>()
@@ -888,12 +890,6 @@ impl PeerConnection {
             let state = state_rx.borrow().clone();
             match state {
                 crate::transports::dtls::DtlsState::Connected(_, profile_opt) => {
-                    println!("Negotiated SRTP Profile ID: {:?}", profile_opt);
-                    // Setup SRTP
-                    // RFC 5764:
-                    // label = "EXTRACTOR-dtls_srtp"
-                    // len = 2 * (key_len + salt_len)
-
                     // Default to Aes128Sha1_80 if not specified or unknown
                     let profile = match profile_opt {
                         Some(0x0001) => crate::srtp::SrtpProfile::Aes128Sha1_80,
@@ -1723,9 +1719,9 @@ impl PeerConnectionInner {
                                         if let Some(id_str) = val.split_whitespace().next() {
                                             rid_id = Some(id_str.to_string());
                                         }
-                                    } else if val
-                                        .contains("urn:ietf:params:rtp-hdrext:sdes:repaired-rtp-stream-id")
-                                    {
+                                    } else if val.contains(
+                                        "urn:ietf:params:rtp-hdrext:sdes:repaired-rtp-stream-id",
+                                    ) {
                                         if let Some(id_str) = val.split_whitespace().next() {
                                             repaired_rid_id = Some(id_str.to_string());
                                         }
@@ -2167,10 +2163,20 @@ pub struct RtpReceiver {
     ssrc: Mutex<u32>,
     params: Mutex<RtpCodecParameters>,
     transport: Mutex<Option<Arc<RtpTransport>>>,
+    packet_tx: Mutex<Option<mpsc::Sender<RtpPacket>>>,
     rtcp_feedback_ssrc: Mutex<Option<u32>>,
     fir_seq: AtomicU8,
     feedback_rx: Mutex<Option<mpsc::Receiver<crate::media::track::FeedbackEvent>>>,
-    simulcast_tracks: Mutex<HashMap<String, (Arc<SampleStreamSource>, Arc<SampleStreamTrack>)>>,
+    simulcast_tracks: Mutex<
+        HashMap<
+            String,
+            (
+                Arc<SampleStreamSource>,
+                Arc<SampleStreamTrack>,
+                Option<mpsc::Receiver<crate::media::track::FeedbackEvent>>,
+            ),
+        >,
+    >,
 }
 
 impl RtpReceiver {
@@ -2202,6 +2208,7 @@ impl RtpReceiver {
             ssrc: Mutex::new(ssrc),
             params: Mutex::new(params),
             transport: Mutex::new(None),
+            packet_tx: Mutex::new(None),
             rtcp_feedback_ssrc: Mutex::new(None),
             fir_seq: AtomicU8::new(0),
             feedback_rx: Mutex::new(Some(feedback_rx)),
@@ -2209,35 +2216,77 @@ impl RtpReceiver {
         }
     }
 
-    pub fn add_simulcast_track(&self, rid: String) -> Arc<SampleStreamTrack> {
-        let (source, track, _) = sample_track(self.track.kind(), 100);
+    pub fn add_simulcast_track(self: &Arc<Self>, rid: String) -> Arc<SampleStreamTrack> {
+        let (source, track, feedback_rx) = sample_track(self.track.kind(), 100);
         let source = Arc::new(source);
-        self.simulcast_tracks
-            .lock()
-            .unwrap()
-            .insert(rid.clone(), (source.clone(), track.clone()));
 
         // If transport is already set, register listener for this RID
         let transport = self.transport.lock().unwrap().clone();
-        if let Some(transport) = transport {
+
+        let stored_feedback_rx = if let Some(transport) = transport {
             let (tx, mut rx) = mpsc::channel(100);
-            transport.register_rid_listener(rid, tx);
-            let source = source.clone();
+            transport.register_rid_listener(rid.clone(), tx);
+            let source_clone = source.clone();
             let params = self.params.lock().unwrap().clone();
+            // Shared SSRC for this simulcast track
+            let simulcast_ssrc = Arc::new(Mutex::new(None));
+            let simulcast_ssrc_clone = simulcast_ssrc.clone();
+
             tokio::spawn(async move {
                 while let Some(packet) = rx.recv().await {
+                    {
+                        let mut s = simulcast_ssrc_clone.lock().unwrap();
+                        if s.is_none() {
+                            *s = Some(packet.header.ssrc);
+                        }
+                    }
                     let sample = crate::media::frame::MediaSample::from_rtp_packet(
                         packet,
-                        source.kind(),
+                        source_clone.kind(),
                         params.clock_rate,
                         params.channels,
                     );
-                    if let Err(_) = source.send(sample).await {
+                    if let Err(_) = source_clone.send(sample).await {
                         break;
                     }
                 }
             });
-        }
+
+            // Start feedback loop for this simulcast track
+            let this = self.clone();
+            let transport_clone = transport.clone();
+            let mut feedback_rx = feedback_rx;
+            tokio::spawn(async move {
+                while let Some(event) = feedback_rx.recv().await {
+                    match event {
+                        crate::media::track::FeedbackEvent::RequestKeyFrame => {
+                            let ssrc_opt = *simulcast_ssrc.lock().unwrap();
+                            if let Some(ssrc) = ssrc_opt {
+                                let sender_ssrc = *this.rtcp_feedback_ssrc.lock().unwrap();
+                                let pli = crate::rtp::PictureLossIndication {
+                                    sender_ssrc: sender_ssrc.unwrap_or(0),
+                                    media_ssrc: ssrc,
+                                };
+                                let packet = crate::rtp::RtcpPacket::PictureLossIndication(pli);
+                                if let Err(e) = transport_clone.send_rtcp(&[packet]).await {
+                                    warn!("Failed to send PLI for simulcast track: {}", e);
+                                }
+                            } else {
+                                warn!("Cannot send PLI for simulcast track: SSRC unknown");
+                            }
+                        }
+                    }
+                }
+            });
+            None
+        } else {
+            Some(feedback_rx)
+        };
+
+        self.simulcast_tracks
+            .lock()
+            .unwrap()
+            .insert(rid, (source, track.clone(), stored_feedback_rx));
 
         track
     }
@@ -2279,7 +2328,7 @@ impl RtpReceiver {
 
     pub fn simulcast_track(&self, rid: &str) -> Option<Arc<SampleStreamTrack>> {
         let tracks = self.simulcast_tracks.lock().unwrap();
-        tracks.get(rid).map(|(_, track)| track.clone())
+        tracks.get(rid).map(|(_, track, _)| track.clone())
     }
 
     pub fn get_simulcast_rids(&self) -> Vec<String> {
@@ -2293,13 +2342,22 @@ impl RtpReceiver {
 
     pub fn set_ssrc(&self, ssrc: u32) {
         *self.ssrc.lock().unwrap() = ssrc;
+        let transport = self.transport.lock().unwrap().clone();
+        let packet_tx = self.packet_tx.lock().unwrap().clone();
+
+        if let Some(transport) = transport
+            && let Some(tx) = packet_tx
+        {
+            transport.register_listener_sync(ssrc, tx);
+        }
     }
 
-    pub fn set_transport(&self, transport: Arc<RtpTransport>) {
+    pub fn set_transport(self: &Arc<Self>, transport: Arc<RtpTransport>) {
         *self.transport.lock().unwrap() = Some(transport.clone());
         let (tx, mut rx) = mpsc::channel(100);
         let ssrc = *self.ssrc.lock().unwrap();
-        transport.register_listener_sync(ssrc, tx);
+        transport.register_listener_sync(ssrc, tx.clone());
+        *self.packet_tx.lock().unwrap() = Some(tx);
         let source = self.source.clone();
         let params = self.params.lock().unwrap().clone();
 
@@ -2318,14 +2376,25 @@ impl RtpReceiver {
         });
 
         // Register simulcast listeners
-        let simulcast_tracks = self.simulcast_tracks.lock().unwrap().clone();
-        for (rid, (source, _)) in simulcast_tracks {
+        let mut tracks_guard = self.simulcast_tracks.lock().unwrap();
+        for (rid, (source, _, feedback_rx_opt)) in tracks_guard.iter_mut() {
             let (tx, mut rx) = mpsc::channel(100);
-            transport.register_rid_listener(rid, tx);
+            transport.register_rid_listener(rid.clone(), tx);
             let source = source.clone();
             let params = params.clone();
+
+            // Shared SSRC for this simulcast track
+            let simulcast_ssrc = Arc::new(Mutex::new(None));
+            let simulcast_ssrc_clone = simulcast_ssrc.clone();
+
             tokio::spawn(async move {
                 while let Some(packet) = rx.recv().await {
+                    {
+                        let mut s = simulcast_ssrc_clone.lock().unwrap();
+                        if s.is_none() {
+                            *s = Some(packet.header.ssrc);
+                        }
+                    }
                     let sample = crate::media::frame::MediaSample::from_rtp_packet(
                         packet,
                         source.kind(),
@@ -2337,6 +2406,33 @@ impl RtpReceiver {
                     }
                 }
             });
+
+            if let Some(mut feedback_rx) = feedback_rx_opt.take() {
+                let this = self.clone();
+                let transport_clone = transport.clone();
+                tokio::spawn(async move {
+                    while let Some(event) = feedback_rx.recv().await {
+                        match event {
+                            crate::media::track::FeedbackEvent::RequestKeyFrame => {
+                                let ssrc_opt = *simulcast_ssrc.lock().unwrap();
+                                if let Some(ssrc) = ssrc_opt {
+                                    let sender_ssrc = *this.rtcp_feedback_ssrc.lock().unwrap();
+                                    let pli = crate::rtp::PictureLossIndication {
+                                        sender_ssrc: sender_ssrc.unwrap_or(0),
+                                        media_ssrc: ssrc,
+                                    };
+                                    let packet = crate::rtp::RtcpPacket::PictureLossIndication(pli);
+                                    if let Err(e) = transport_clone.send_rtcp(&[packet]).await {
+                                        warn!("Failed to send PLI for simulcast track: {}", e);
+                                    }
+                                } else {
+                                    warn!("Cannot send PLI for simulcast track: SSRC unknown");
+                                }
+                            }
+                        }
+                    }
+                });
+            }
         }
     }
 

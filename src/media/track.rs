@@ -423,8 +423,8 @@ impl MediaStreamTrack for SelectorTrack {
     }
 
     fn state(&self) -> TrackState {
-        // We could check the current track state, but for a selector, 
-        // it's live as long as it can switch. 
+        // We could check the current track state, but for a selector,
+        // it's live as long as it can switch.
         // Simplification: just return Live.
         TrackState::Live
     }
@@ -464,11 +464,17 @@ mod tests {
     async fn selector_switches_source() {
         let (source_a, track_a, _) = sample_track(MediaKind::Audio, 10);
         let (source_b, track_b, _) = sample_track(MediaKind::Audio, 10);
-        
+
         let selector = Arc::new(SelectorTrack::new(track_a));
-        
+
         // Send on A
-        source_a.send_audio(AudioFrame { samples: 100, ..Default::default() }).await.unwrap();
+        source_a
+            .send_audio(AudioFrame {
+                samples: 100,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
         let sample = selector.recv_audio().await.unwrap();
         assert_eq!(sample.samples, 100);
 
@@ -476,7 +482,13 @@ mod tests {
         selector.switch_to(track_b).await.unwrap();
 
         // Send on B
-        source_b.send_audio(AudioFrame { samples: 200, ..Default::default() }).await.unwrap();
+        source_b
+            .send_audio(AudioFrame {
+                samples: 200,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
         let sample = selector.recv_audio().await.unwrap();
         assert_eq!(sample.samples, 200);
     }
@@ -485,19 +497,25 @@ mod tests {
     async fn selector_propagates_key_frame_request() {
         let (_source_a, track_a, mut feedback_a) = sample_track(MediaKind::Video, 10);
         let (_source_b, track_b, mut feedback_b) = sample_track(MediaKind::Video, 10);
-        
+
         let selector = Arc::new(SelectorTrack::new(track_a));
-        
+
         // Request on A
         selector.request_key_frame().await.unwrap();
-        assert!(matches!(feedback_a.recv().await.unwrap(), FeedbackEvent::RequestKeyFrame));
+        assert!(matches!(
+            feedback_a.recv().await.unwrap(),
+            FeedbackEvent::RequestKeyFrame
+        ));
 
         // Switch to B
         selector.switch_to(track_b).await.unwrap();
 
         // Request on B
         selector.request_key_frame().await.unwrap();
-        assert!(matches!(feedback_b.recv().await.unwrap(), FeedbackEvent::RequestKeyFrame));
+        assert!(matches!(
+            feedback_b.recv().await.unwrap(),
+            FeedbackEvent::RequestKeyFrame
+        ));
     }
 
     #[tokio::test]

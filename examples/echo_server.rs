@@ -11,6 +11,7 @@ use rustrtc::media::{
     MediaError, MediaKind, MediaResult, MediaSample, MediaSource, Packetizer, TrackMediaSink,
     VideoFrame, Vp8Payloader, spawn_media_pump,
 };
+use rustrtc::sdp::MediaKind as SdpMediaKind;
 use rustrtc::{RtcConfiguration, SdpType, SessionDescription};
 use serde::{Deserialize, Serialize};
 use std::fs::File;
@@ -70,6 +71,34 @@ fn default_mode() -> Mode {
     Mode::Echo
 }
 
+fn find_vp8_payload_type(desc: &SessionDescription) -> Option<u8> {
+    for media in &desc.media_sections {
+        if media.kind != SdpMediaKind::Video {
+            continue;
+        }
+
+        for attr in &media.attributes {
+            if attr.key != "rtpmap" {
+                continue;
+            }
+
+            if let Some(value) = &attr.value {
+                let mut parts = value.split_whitespace();
+                if let (Some(pt_str), Some(codec_part)) = (parts.next(), parts.next()) {
+                    let codec_name = codec_part.split('/').next().unwrap_or("");
+                    if codec_name.eq_ignore_ascii_case("VP8") {
+                        if let Ok(pt) = pt_str.parse::<u8>() {
+                            return Some(pt);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    None
+}
+
 #[derive(Serialize)]
 struct OfferResponse {
     sdp: String,
@@ -87,7 +116,8 @@ async fn handle_rustrtc_offer(payload: OfferRequest) -> Json<OfferResponse> {
     info!("Offer SDP:\n{}", payload.sdp);
     // Handle SDP first to extract capabilities
     let offer_sdp = SessionDescription::parse(SdpType::Offer, &payload.sdp).unwrap();
-    let vp8_pt: u8 = 96; // Default
+    let vp8_pt = find_vp8_payload_type(&offer_sdp).unwrap_or(96);
+    info!("Determined VP8 Payload Type: {}", vp8_pt);
     let mut config = RtcConfiguration::default();
     // Configure media capabilities with the found PT
     let mut caps = rustrtc::config::MediaCapabilities::default();
@@ -192,6 +222,23 @@ async fn start_echo(pc: PeerConnection, vp8_pt: u8) {
         };
 
         let incoming_track = receiver.track();
+        // Check for simulcast
+        let simulcast_rids = receiver.get_simulcast_rids();
+        let incoming_track = if !simulcast_rids.is_empty() {
+            // Prefer "lo" (low resolution) as it's most likely to be sent first/always
+            let rid = if simulcast_rids.contains(&"lo".to_string()) {
+                "lo"
+            } else if simulcast_rids.contains(&"mid".to_string()) {
+                "mid"
+            } else {
+                simulcast_rids.first().unwrap()
+            };
+            info!("Using simulcast track: {}", rid);
+            receiver.simulcast_track(rid).unwrap()
+        } else {
+            incoming_track
+        };
+
         let (sample_source, outgoing_track, _) = media::sample_track(MediaStreamKind::Video, 120);
 
         let ssrc = 5000 + transceiver.id() as u32;
@@ -205,6 +252,24 @@ async fn start_echo(pc: PeerConnection, vp8_pt: u8) {
             payload_type: vp8_pt,
             clock_rate: 90000,
             channels: 0,
+        });
+
+        let mut rtcp_rx = sender.subscribe_rtcp();
+        let incoming_track_clone = incoming_track.clone();
+        tokio::spawn(async move {
+            while let Ok(packet) = rtcp_rx.recv().await {
+                match packet {
+                    rustrtc::rtp::RtcpPacket::PictureLossIndication(_)
+                    | rustrtc::rtp::RtcpPacket::FullIntraRequest(_) => {
+                        if let Err(e) = incoming_track_clone.request_key_frame().await {
+                            warn!("Failed to request key frame: {}", e);
+                        } else {
+                            info!("Forwarded PLI/FIR to incoming track");
+                        }
+                    }
+                    _ => {}
+                }
+            }
         });
 
         transceiver.set_sender(Some(sender));
@@ -223,6 +288,21 @@ async fn start_echo(pc: PeerConnection, vp8_pt: u8) {
                         if is_empty {
                             continue;
                         }
+
+                        // Modify sample to strip extensions and ensure PT matches
+                        let mut sample = sample;
+                        if let MediaSample::Video(ref mut f) = sample {
+                            // Filter out non-VP8 packets (e.g. RTX)
+                            if let Some(pt) = f.payload_type {
+                                if pt != vp8_pt {
+                                    info!("Dropping video packet with PT: {}", pt);
+                                    continue;
+                                }
+                            }
+                            // Strip extensions to avoid sending bad transport-cc
+                            f.header_extension = None;
+                        }
+
                         if let Err(err) = sample_source.send(sample).await {
                             warn!("Video echo forwarder stopped: {}", err);
                             break;

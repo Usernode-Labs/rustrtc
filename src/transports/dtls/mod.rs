@@ -299,9 +299,26 @@ impl DtlsInner {
         if let Some(buf) = &ctx.last_flight_buffer
             && is_client
             && ctx.message_seq == 1
-            && let Err(e) = self.conn.send(buf).await
         {
-            warn!("Retransmission failed: {}", e);
+            if let Err(e) = self.conn.send(buf).await {
+                if let Some(io_err) = e.downcast_ref::<std::io::Error>() {
+                    match io_err.kind() {
+                        std::io::ErrorKind::HostUnreachable
+                        | std::io::ErrorKind::NetworkUnreachable => {
+                            debug!("Retransmission failed: {}", e);
+                        }
+                        _ => {
+                            if io_err.raw_os_error() == Some(65) {
+                                debug!("Retransmission failed: {}", e);
+                            } else {
+                                warn!("Retransmission failed: {}", e);
+                            }
+                        }
+                    }
+                } else {
+                    warn!("Retransmission failed: {}", e);
+                }
+            }
         }
     }
 
@@ -576,7 +593,23 @@ impl DtlsInner {
         if ctx.server_random.is_some() {
             if let Some(flight) = &ctx.last_flight_buffer {
                 if let Err(e) = self.conn.send(flight).await {
-                    warn!("Failed to retransmit flight: {}", e);
+                    if let Some(io_err) = e.downcast_ref::<std::io::Error>() {
+                        match io_err.kind() {
+                            std::io::ErrorKind::HostUnreachable
+                            | std::io::ErrorKind::NetworkUnreachable => {
+                                debug!("Failed to retransmit flight: {}", e);
+                            }
+                            _ => {
+                                if io_err.raw_os_error() == Some(65) {
+                                    debug!("Failed to retransmit flight: {}", e);
+                                } else {
+                                    warn!("Failed to retransmit flight: {}", e);
+                                }
+                            }
+                        }
+                    } else {
+                        warn!("Failed to retransmit flight: {}", e);
+                    }
                 }
             }
             return Ok(());
@@ -656,7 +689,7 @@ impl DtlsInner {
             } else {
                 srtp_profiles[0]
             };
-            
+
             ctx.srtp_profile = Some(selected_profile);
             extensions.extend_from_slice(&[0x00, 0x0e]); // Type 14
             extensions.extend_from_slice(&[0x00, 0x05]); // Length
@@ -1532,7 +1565,23 @@ impl DtlsInner {
         let mut buf = BytesMut::new();
         record.encode(&mut buf);
         if let Err(e) = self.conn.send(&buf).await {
-            warn!("Failed to send DTLS record: {}", e);
+            if let Some(io_err) = e.downcast_ref::<std::io::Error>() {
+                match io_err.kind() {
+                    std::io::ErrorKind::HostUnreachable
+                    | std::io::ErrorKind::NetworkUnreachable => {
+                        debug!("Failed to send DTLS record: {}", e);
+                    }
+                    _ => {
+                        if io_err.raw_os_error() == Some(65) {
+                            debug!("Failed to send DTLS record: {}", e);
+                        } else {
+                            warn!("Failed to send DTLS record: {}", e);
+                        }
+                    }
+                }
+            } else {
+                warn!("Failed to send DTLS record: {}", e);
+            }
             return Err(e);
         }
 

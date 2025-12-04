@@ -618,7 +618,7 @@ async fn perform_connectivity_checks_async(inner: Arc<IceTransportInner>) {
 
         checks.push(async move {
             let key = (local.address, remote.address);
-            let res = perform_binding_check(&local, &remote, &inner, role).await;
+            let res = perform_binding_check(&local, &remote, &inner, role, false).await;
 
             {
                 let mut checking = inner.checking_pairs.lock().await;
@@ -651,6 +651,29 @@ async fn perform_connectivity_checks_async(inner: Arc<IceTransportInner>) {
                 "ICE checks complete. Selected pair: {} -> {}",
                 pair.local.address, pair.remote.address
             );
+
+            if role == IceRole::Controlling {
+                debug!(
+                    "Controlling agent nominating pair: {} -> {}",
+                    pair.local.address, pair.remote.address
+                );
+                let inner_clone = inner.clone();
+                let pair_clone = pair.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = perform_binding_check(
+                        &pair_clone.local,
+                        &pair_clone.remote,
+                        &inner_clone,
+                        role,
+                        true,
+                    )
+                    .await
+                    {
+                        warn!("Failed to send nomination: {}", e);
+                    }
+                });
+            }
+
             break;
         }
     }
@@ -754,7 +777,25 @@ async fn handle_stun_request(
     if let Ok(bytes) = response.encode(Some(password.as_bytes()), true) {
         match sender.send_to(&bytes, addr).await {
             Ok(_) => trace!("Sent STUN Response to {}", addr),
-            Err(e) => warn!("Failed to send STUN Response to {}: {}", addr, e),
+            Err(e) => {
+                if let Some(io_err) = e.downcast_ref::<std::io::Error>() {
+                    match io_err.kind() {
+                        std::io::ErrorKind::HostUnreachable
+                        | std::io::ErrorKind::NetworkUnreachable => {
+                            debug!("Failed to send STUN Response to {}: {}", addr, e);
+                        }
+                        _ => {
+                            if io_err.raw_os_error() == Some(65) {
+                                debug!("Failed to send STUN Response to {}: {}", addr, e);
+                            } else {
+                                warn!("Failed to send STUN Response to {}: {}", addr, e);
+                            }
+                        }
+                    }
+                } else {
+                    warn!("Failed to send STUN Response to {}: {}", addr, e);
+                }
+            }
         }
     } else {
         warn!("Failed to encode STUN Response");
@@ -848,6 +889,7 @@ async fn perform_binding_check(
     remote: &IceCandidate,
     inner: &Arc<IceTransportInner>,
     role: IceRole,
+    nominated: bool,
 ) -> Result<()> {
     if remote.transport != "udp" {
         bail!("only UDP connectivity checks are supported");
@@ -872,7 +914,9 @@ async fn perform_binding_check(
         IceRole::Controlling => {
             msg.attributes
                 .push(StunAttribute::IceControlling(local_params.tie_breaker));
-            msg.attributes.push(StunAttribute::UseCandidate);
+            if nominated {
+                msg.attributes.push(StunAttribute::UseCandidate);
+            }
         }
         IceRole::Controlled => msg
             .attributes
@@ -954,7 +998,20 @@ async fn perform_binding_check(
         } else if let Some(socket) = &socket {
             trace!("Sending STUN Request to {} tx={:?}", remote.address, tx_id);
             if let Err(e) = socket.send_to(&bytes, remote.address).await {
-                warn!("socket.send_to failed: {}", e);
+                match e.kind() {
+                    std::io::ErrorKind::HostUnreachable
+                    | std::io::ErrorKind::NetworkUnreachable => {
+                        debug!("socket.send_to failed: {}", e);
+                    }
+                    _ => {
+                        // Also check raw OS error for cases not covered by ErrorKind
+                        if e.raw_os_error() == Some(65) {
+                            debug!("socket.send_to failed: {}", e);
+                        } else {
+                            warn!("socket.send_to failed: {}", e);
+                        }
+                    }
+                }
                 return Err(e.into());
             }
         }

@@ -79,6 +79,33 @@ impl RtpHeader {
                     }
                     offset += len;
                 }
+            } else if ext.profile == 0x1000 {
+                let mut offset = 0;
+                while offset < ext.data.len() {
+                    let ext_id = ext.data[offset];
+                    if ext_id == 0 {
+                        offset += 1;
+                        continue;
+                    }
+                    offset += 1;
+
+                    if offset >= ext.data.len() {
+                        break;
+                    }
+                    let len = ext.data[offset] as usize;
+                    offset += 1;
+
+                    if ext_id == id {
+                        if offset + len <= ext.data.len() {
+                            return Some(ext.data[offset..offset + len].to_vec());
+                        } else {
+                            return None;
+                        }
+                    }
+                    offset += len;
+                }
+            } else {
+                // Unsupported extension profile
             }
         }
         None
