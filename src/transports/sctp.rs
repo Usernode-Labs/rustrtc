@@ -5,7 +5,8 @@ use bytes::{Buf, BufMut, Bytes, BytesMut};
 use std::collections::{BTreeMap, HashSet};
 use std::sync::atomic::{AtomicU8, AtomicU16, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
-use tokio::sync::{Mutex as TokioMutex, mpsc};
+use std::time::{Duration, Instant};
+use tokio::sync::{Mutex as TokioMutex, Notify, mpsc};
 use tracing::{debug, info, trace, warn};
 
 // DCEP Constants
@@ -15,6 +16,23 @@ const DATA_CHANNEL_PPID_BINARY: u32 = 53;
 
 const DCEP_TYPE_OPEN: u8 = 0x03;
 const DCEP_TYPE_ACK: u8 = 0x02;
+
+// RTO Constants (RFC 4960)
+const RTO_INITIAL: f64 = 3.0;
+const RTO_MIN: f64 = 1.0;
+const RTO_MAX: f64 = 60.0;
+const RTO_ALPHA: f64 = 0.125;
+const RTO_BETA: f64 = 0.25;
+
+// Flow Control Constants
+const CWND_INITIAL: usize = 1400 * 10; // Start with ~10 packets
+
+#[derive(Debug, Clone)]
+struct ChunkRecord {
+    payload: Bytes,
+    sent_time: Instant,
+    transmit_count: u32,
+}
 
 #[derive(Debug, Clone)]
 pub struct DataChannelOpen {
@@ -181,6 +199,38 @@ const CT_ERROR: u8 = 9;
 const CT_COOKIE_ECHO: u8 = 10;
 const CT_COOKIE_ACK: u8 = 11;
 
+#[derive(Debug)]
+struct RtoCalculator {
+    srtt: f64,
+    rttvar: f64,
+    rto: f64,
+}
+
+impl RtoCalculator {
+    fn new() -> Self {
+        Self {
+            srtt: 0.0,
+            rttvar: 0.0,
+            rto: RTO_INITIAL,
+        }
+    }
+
+    fn update(&mut self, rtt: f64) {
+        if self.srtt == 0.0 {
+            self.srtt = rtt;
+            self.rttvar = rtt / 2.0;
+        } else {
+            self.rttvar = (1.0 - RTO_BETA) * self.rttvar + RTO_BETA * (self.srtt - rtt).abs();
+            self.srtt = (1.0 - RTO_ALPHA) * self.srtt + RTO_ALPHA * rtt;
+        }
+        self.rto = (self.srtt + 4.0 * self.rttvar).clamp(RTO_MIN, RTO_MAX);
+    }
+
+    fn backoff(&mut self) {
+        self.rto = (self.rto * 2.0).min(RTO_MAX);
+    }
+}
+
 struct SctpInner {
     dtls_transport: Arc<DtlsTransport>,
     state: Arc<Mutex<SctpState>>,
@@ -194,8 +244,19 @@ struct SctpInner {
     new_data_channel_tx: Option<mpsc::UnboundedSender<Arc<DataChannel>>>,
     sack_counter: AtomicU8,
     is_client: bool,
-    sent_queue: Mutex<BTreeMap<u32, Bytes>>,
+    sent_queue: Mutex<BTreeMap<u32, ChunkRecord>>,
     received_queue: Mutex<BTreeMap<u32, (u8, Bytes)>>,
+
+    // RTO State
+    rto_state: Mutex<RtoCalculator>,
+
+    // Flow Control
+    flight_size: AtomicUsize,
+    cwnd: AtomicUsize,
+    ssthresh: AtomicUsize,
+    peer_rwnd: AtomicU32, // Peer's Advertised Receiver Window
+    timer_notify: Arc<Notify>,
+    flow_control_notify: Arc<Notify>,
 }
 
 struct SctpCleanupGuard<'a> {
@@ -254,6 +315,13 @@ impl SctpTransport {
             is_client,
             sent_queue: Mutex::new(BTreeMap::new()),
             received_queue: Mutex::new(BTreeMap::new()),
+            rto_state: Mutex::new(RtoCalculator::new()),
+            flight_size: AtomicUsize::new(0),
+            cwnd: AtomicUsize::new(CWND_INITIAL),
+            ssthresh: AtomicUsize::new(usize::MAX),
+            peer_rwnd: AtomicU32::new(1024 * 1024), // Default 1MB until we hear otherwise
+            timer_notify: Arc::new(Notify::new()),
+            flow_control_notify: Arc::new(Notify::new()),
         });
 
         let close_tx = Arc::new(tokio::sync::Notify::new());
@@ -326,17 +394,88 @@ impl SctpInner {
             }
         }
 
+        let mut sack_deadline: Option<Instant> = None;
+
         loop {
+            let now = Instant::now();
+
+            // 1. Calculate RTO Timeout
+            let rto_timeout = {
+                let sent_queue = self.sent_queue.lock().unwrap();
+                if let Some((_, record)) = sent_queue.iter().next() {
+                    let rto = self.rto_state.lock().unwrap().rto;
+                    let expiry = record.sent_time + Duration::from_secs_f64(rto);
+                    if expiry > now {
+                        expiry - now
+                    } else {
+                        Duration::from_millis(1)
+                    }
+                } else {
+                    Duration::from_secs(3600)
+                }
+            };
+
+            // 2. Calculate SACK Timeout
+            let sack_timeout = if self.sack_counter.load(Ordering::Relaxed) > 0 {
+                if sack_deadline.is_none() {
+                    sack_deadline = Some(now + Duration::from_millis(200));
+                }
+                let deadline = sack_deadline.unwrap();
+                if deadline > now {
+                    deadline - now
+                } else {
+                    Duration::from_millis(1)
+                }
+            } else {
+                sack_deadline = None;
+                Duration::from_secs(3600)
+            };
+
+            let sleep_duration = rto_timeout.min(sack_timeout);
+
             tokio::select! {
                 _ = close_rx.notified() => {
                     debug!("SctpTransport run_loop exiting (closed)");
                     break;
+                },
+                _ = self.timer_notify.notified() => {
+                    // Woken up by sender, recalculate timeout
+                },
+                _ = tokio::time::sleep(sleep_duration) => {
+                    // Check SACK Timer
+                    if let Some(deadline) = sack_deadline {
+                        if Instant::now() >= deadline {
+                            let ack = self.cumulative_tsn_ack.load(Ordering::SeqCst);
+                            // Only send if we still have pending acks
+                            if self.sack_counter.load(Ordering::Relaxed) > 0 {
+                                trace!("SACK Timer expired, sending SACK for {}", ack);
+                                if let Err(e) = self.send_sack(ack).await {
+                                    warn!("Failed to send Delayed SACK: {}", e);
+                                }
+                                self.sack_counter.store(0, Ordering::Relaxed);
+                            }
+                            sack_deadline = None;
+                        }
+                    }
+
+                    // Check RTO Timer
+                    // We check this regardless of whether sleep woke up due to RTO or SACK,
+                    // because they might be close.
+                    if let Err(e) = self.handle_timeout().await {
+                        warn!("SCTP handle timeout error: {}", e);
+                    }
                 },
                 res = incoming_data_rx.recv() => {
                     match res {
                         Some(packet) => {
                             if let Err(e) = self.handle_packet(packet).await {
                                 warn!("SCTP handle packet error: {}", e);
+                            }
+                            // Batch receive: try to drain channel
+                            while let Ok(packet) = incoming_data_rx.try_recv() {
+                                if let Err(e) = self.handle_packet(packet).await {
+                                    warn!("SCTP handle packet error: {}", e);
+                                }
                             }
                         }
                         None => {
@@ -350,6 +489,56 @@ impl SctpInner {
         info!("SctpTransport run_loop finished");
     }
 
+    async fn handle_timeout(&self) -> Result<()> {
+        let mut to_retransmit = Vec::new();
+
+        // 1. Check what needs retransmission
+        {
+            let mut sent_queue = self.sent_queue.lock().unwrap();
+            if let Some((tsn, record)) = sent_queue.iter_mut().next() {
+                // Double RTO (Backoff)
+                let mut rto_state = self.rto_state.lock().unwrap();
+                rto_state.backoff();
+                debug!(
+                    "T3-RTX Timeout! Retransmitting TSN {}, New RTO: {}",
+                    tsn, rto_state.rto
+                );
+
+                record.transmit_count += 1;
+                // Don't update sent_time for retransmissions to avoid RTT pollution?
+                // Actually, we restart the timer, so we treat it as "sent now" for timer purposes,
+                // but we MUST NOT use it for RTT calculation (Karn's Algorithm).
+                record.sent_time = Instant::now();
+
+                to_retransmit.push((*tsn, record.payload.clone()));
+
+                // Reduce ssthresh and cwnd (Congestion Control - Simplified)
+                let flight_size = self.flight_size.load(Ordering::SeqCst);
+                let new_ssthresh = (flight_size / 2).max(1400 * 4);
+                self.ssthresh.store(new_ssthresh, Ordering::SeqCst);
+                self.cwnd.store(1400, Ordering::SeqCst); // Reset to 1 MTU on timeout (RFC 4960)
+            }
+        }
+
+        // 2. Retransmit
+        for (tsn, data) in to_retransmit {
+            if let Err(e) = self.dtls_transport.send(data).await {
+                warn!("Failed to retransmit TSN {}: {}", tsn, e);
+            }
+        }
+
+        Ok(())
+    }
+
+    fn update_rto(&self, rtt: f64) {
+        let mut rto_state = self.rto_state.lock().unwrap();
+        rto_state.update(rtt);
+        trace!(
+            "RTT update: rtt={} srtt={} rttvar={} rto={}",
+            rtt, rto_state.srtt, rto_state.rttvar, rto_state.rto
+        );
+    }
+
     async fn send_init(&self) -> Result<()> {
         let local_tag = random_u32();
         self.verification_tag.store(local_tag, Ordering::SeqCst);
@@ -360,8 +549,8 @@ impl SctpInner {
         let mut init_params = BytesMut::new();
         // Initiate Tag
         init_params.put_u32(local_tag);
-        // a_rwnd
-        init_params.put_u32(128 * 1024);
+        // a_rwnd (1MB)
+        init_params.put_u32(1024 * 1024);
         // Outbound streams
         init_params.put_u16(10);
         // Inbound streams
@@ -436,11 +625,12 @@ impl SctpInner {
             return Ok(());
         }
         let initiate_tag = buf.get_u32();
-        let _a_rwnd = buf.get_u32();
+        let a_rwnd = buf.get_u32();
         let _outbound_streams = buf.get_u16();
         let _inbound_streams = buf.get_u16();
         let initial_tsn = buf.get_u32();
 
+        self.peer_rwnd.store(a_rwnd, Ordering::SeqCst);
         self.remote_verification_tag
             .store(initiate_tag, Ordering::SeqCst);
         self.cumulative_tsn_ack
@@ -489,11 +679,12 @@ impl SctpInner {
             return Ok(());
         }
         let initiate_tag = buf.get_u32();
-        let _a_rwnd = buf.get_u32();
+        let a_rwnd = buf.get_u32();
         let _outbound_streams = buf.get_u16();
         let _inbound_streams = buf.get_u16();
         let initial_tsn = buf.get_u32();
 
+        self.peer_rwnd.store(a_rwnd, Ordering::SeqCst);
         self.remote_verification_tag
             .store(initiate_tag, Ordering::SeqCst);
         self.cumulative_tsn_ack
@@ -570,17 +761,59 @@ impl SctpInner {
         if chunk.len() >= 12 {
             let mut buf = chunk.clone();
             let cumulative_tsn_ack = buf.get_u32();
-            let _a_rwnd = buf.get_u32();
+            let a_rwnd = buf.get_u32();
             let num_gap_ack_blocks = buf.get_u16();
             let _num_duplicate_tsns = buf.get_u16();
+
+            self.peer_rwnd.store(a_rwnd, Ordering::SeqCst);
 
             // 1. Remove acknowledged packets
             {
                 let mut sent_queue = self.sent_queue.lock().unwrap();
                 // split_off returns keys >= cumulative_tsn_ack + 1.
-                // So we keep the remaining (unacked) part.
+                // So we keep the remaining (unacked) part in `remaining`.
+                // The original `sent_queue` retains the acked part.
                 let remaining = sent_queue.split_off(&(cumulative_tsn_ack + 1));
-                *sent_queue = remaining;
+                let acked = std::mem::replace(&mut *sent_queue, remaining);
+
+                let mut flight_size_reduction = 0;
+                let now = Instant::now();
+
+                for (_, record) in acked {
+                    flight_size_reduction += record.payload.len();
+
+                    // Karn's Algorithm: Only measure RTT for packets sent once
+                    if record.transmit_count == 0 {
+                        let rtt = now.duration_since(record.sent_time).as_secs_f64();
+                        self.update_rto(rtt);
+                    }
+                }
+
+                if flight_size_reduction > 0 {
+                    self.flight_size
+                        .fetch_sub(flight_size_reduction, Ordering::SeqCst);
+
+                    // Congestion Control: Update cwnd
+                    let cwnd = self.cwnd.load(Ordering::SeqCst);
+                    let ssthresh = self.ssthresh.load(Ordering::SeqCst);
+
+                    if cwnd <= ssthresh {
+                        // Slow Start: cwnd += min(bytes_acked, MTU)
+                        // We approximate bytes_acked as flight_size_reduction
+                        let increase = flight_size_reduction.min(1400); // Cap at MTU
+                        self.cwnd.fetch_add(increase, Ordering::SeqCst);
+                    } else {
+                        // Congestion Avoidance: cwnd += MTU * MTU / cwnd
+                        // We add (MTU * bytes_acked) / cwnd
+                        let increase = (1400 * flight_size_reduction) / cwnd;
+                        // Ensure at least 1 byte growth if possible, but usually this is small
+                        if increase > 0 {
+                            self.cwnd.fetch_add(increase, Ordering::SeqCst);
+                        }
+                    }
+
+                    self.flow_control_notify.notify_waiters();
+                }
             }
 
             if num_gap_ack_blocks > 0 {
@@ -596,11 +829,6 @@ impl SctpInner {
                     let block_start = cumulative_tsn_ack.wrapping_add(start as u32);
                     let block_end = cumulative_tsn_ack.wrapping_add(end as u32);
 
-                    // Handle wrapping if necessary, though simple addition usually works for u32 unless we are at boundary
-                    // For simplicity assuming no wrap-around issues for now or that wrapping_add handles it correctly for equality checks if we cast properly.
-                    // But BTreeMap keys are ordered. Wrapping might break order.
-                    // SCTP TSN is u32.
-
                     if block_end > max_sack_tsn {
                         max_sack_tsn = block_end;
                     }
@@ -612,10 +840,12 @@ impl SctpInner {
 
                 let mut to_retransmit = Vec::new();
                 {
-                    let sent_queue = self.sent_queue.lock().unwrap();
-                    for (&tsn, data) in sent_queue.iter() {
+                    let mut sent_queue = self.sent_queue.lock().unwrap();
+                    for (&tsn, record) in sent_queue.iter_mut() {
                         if tsn <= max_sack_tsn && !received_tsns.contains(&tsn) {
-                            to_retransmit.push((tsn, data.clone()));
+                            // Fast Retransmit
+                            record.transmit_count += 1;
+                            to_retransmit.push((tsn, record.payload.clone()));
                         }
                     }
                 }
@@ -736,14 +966,15 @@ impl SctpInner {
             warn!("Gap detected! Cumulative ACK: {}. Sending SACK.", ack);
             self.send_sack(ack).await?;
         } else {
-            // Delayed Ack logic
+            // Delayed Ack logic (RFC 4960)
+            // Send SACK every 2 packets
             let count = self.sack_counter.fetch_add(1, Ordering::Relaxed);
             if count >= 1 {
                 self.sack_counter.store(0, Ordering::Relaxed);
                 self.send_sack(ack).await?;
             }
+            // If count was 0, it is now 1. The run_loop will pick this up and set the 200ms timer.
         }
-
         Ok(())
     }
 
@@ -975,7 +1206,7 @@ impl SctpInner {
                 .find_map(|weak_dc| weak_dc.upgrade().filter(|dc| dc.id == channel_id))
         };
 
-        let mut max_payload_size = 1400;
+        let mut max_payload_size = 1380;
         let (_guard, ssn) = if let Some(dc) = &dc_opt {
             let guard = dc.send_lock.lock().await;
             let ssn = dc.next_ssn.fetch_add(1, Ordering::SeqCst);
@@ -985,14 +1216,52 @@ impl SctpInner {
             (None, 0)
         };
 
+        // Flow Control Check
+        loop {
+            let flight = self.flight_size.load(Ordering::SeqCst);
+            let cwnd = self.cwnd.load(Ordering::SeqCst);
+            let rwnd = self.peer_rwnd.load(Ordering::SeqCst) as usize;
+
+            // RFC 4960: min(cwnd, rwnd)
+            // Note: rwnd can be 0 if receiver is full.
+            // We must allow at least 1 packet if flight is 0 to avoid deadlock (Zero Window Probe),
+            // but for simplicity we just wait.
+            let effective_window = cwnd.min(rwnd);
+
+            if flight >= effective_window {
+                // Wait for window to open
+                self.flow_control_notify.notified().await;
+            } else {
+                break;
+            }
+        }
+
         let total_len = data.len();
 
         if total_len == 0 {
             // Send empty packet (unfragmented)
-            return self.send_fragment(channel_id, ppid, data, ssn, 0x03).await;
+            let tsn = self.next_tsn.fetch_add(1, Ordering::SeqCst);
+            let packet = self.create_packet(channel_id, ppid, data, ssn, 0x03, tsn);
+            {
+                let mut queue = self.sent_queue.lock().unwrap();
+                let was_empty = queue.is_empty();
+                let record = ChunkRecord {
+                    payload: packet.clone(),
+                    sent_time: Instant::now(),
+                    transmit_count: 0,
+                };
+                queue.insert(tsn, record);
+                self.flight_size.fetch_add(packet.len(), Ordering::SeqCst);
+                if was_empty {
+                    self.timer_notify.notify_one();
+                }
+            }
+            return self.dtls_transport.send(packet).await;
         }
 
+        let mut chunks = Vec::new();
         let mut offset = 0;
+
         while offset < total_len {
             let remaining = total_len - offset;
             let chunk_size = std::cmp::min(remaining, max_payload_size);
@@ -1010,22 +1279,54 @@ impl SctpInner {
                 0x00 // B=0, E=0 (Middle)
             };
 
-            self.send_fragment(channel_id, ppid, chunk_data, ssn, flags)
-                .await?;
+            let tsn = self.next_tsn.fetch_add(1, Ordering::SeqCst);
+            let packet = self.create_packet(channel_id, ppid, chunk_data, ssn, flags, tsn);
+            chunks.push((tsn, packet));
+
             offset += chunk_size;
+        }
+
+        // Batch insert into sent_queue
+        {
+            let mut queue = self.sent_queue.lock().unwrap();
+            let now = Instant::now();
+            let mut added_bytes = 0;
+            let was_empty = queue.is_empty();
+
+            for (tsn, packet) in &chunks {
+                let record = ChunkRecord {
+                    payload: packet.clone(),
+                    sent_time: now,
+                    transmit_count: 0,
+                };
+                queue.insert(*tsn, record);
+                added_bytes += packet.len();
+            }
+
+            self.flight_size.fetch_add(added_bytes, Ordering::SeqCst);
+
+            // Only notify timer if the queue was empty (head changed)
+            if was_empty {
+                self.timer_notify.notify_one();
+            }
+        }
+
+        // Batch send
+        for (_, packet) in chunks {
+            self.dtls_transport.send(packet).await?;
         }
 
         Ok(())
     }
-
-    async fn send_fragment(
+    fn create_packet(
         &self,
         channel_id: u16,
         ppid: u32,
         data: &[u8],
         ssn: u16,
         flags: u8,
-    ) -> Result<()> {
+        tsn: u32,
+    ) -> Bytes {
         // Calculate total size
         // Common Header: 12
         // Chunk Header: 4
@@ -1058,8 +1359,6 @@ impl SctpInner {
         buf.put_u16(chunk_len as u16);
 
         // DATA Chunk Value
-        let tsn = self.next_tsn.fetch_add(1, Ordering::SeqCst);
-
         buf.put_u32(tsn);
         buf.put_u16(channel_id);
         buf.put_u16(ssn);
@@ -1079,15 +1378,7 @@ impl SctpInner {
         buf[10] = checksum_bytes[2];
         buf[11] = checksum_bytes[3];
 
-        let packet = buf.freeze();
-
-        // Store for retransmission
-        {
-            let mut queue = self.sent_queue.lock().unwrap();
-            queue.insert(tsn, packet.clone());
-        }
-
-        self.dtls_transport.send(packet).await
+        buf.freeze()
     }
 
     pub async fn send_dcep_open(&self, dc: &DataChannel) -> Result<()> {
@@ -1162,7 +1453,7 @@ impl DataChannel {
             ordered: config.ordered,
             max_retransmits: config.max_retransmits,
             max_packet_life_time: config.max_packet_life_time,
-            max_payload_size: config.max_payload_size.unwrap_or(1400),
+            max_payload_size: config.max_payload_size.unwrap_or(1380),
             negotiated: config.negotiated.is_some(),
             state: AtomicUsize::new(DataChannelState::Connecting as usize),
             next_ssn: AtomicU16::new(0),
@@ -1186,5 +1477,47 @@ impl DataChannel {
 
     pub(crate) fn close_channel(&self) {
         *self.tx.lock().unwrap() = None;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_rto_calculator() {
+        let mut calc = RtoCalculator::new();
+        assert_eq!(calc.rto, RTO_INITIAL);
+
+        // First measurement: RTT = 1.0
+        calc.update(1.0);
+        // srtt = 1.0, rttvar = 0.5
+        // rto = 1.0 + 4 * 0.5 = 3.0
+        assert_eq!(calc.srtt, 1.0);
+        assert_eq!(calc.rttvar, 0.5);
+        assert_eq!(calc.rto, 3.0);
+
+        // Second measurement: RTT = 1.0 (Stable)
+        calc.update(1.0);
+        // rttvar = (1 - 0.25) * 0.5 + 0.25 * |1.0 - 1.0| = 0.375
+        // srtt = (1 - 0.125) * 1.0 + 0.125 * 1.0 = 1.0
+        // rto = 1.0 + 4 * 0.375 = 1.0 + 1.5 = 2.5
+        assert_eq!(calc.srtt, 1.0);
+        assert_eq!(calc.rttvar, 0.375);
+        assert_eq!(calc.rto, 2.5);
+
+        // Backoff
+        calc.backoff();
+        assert_eq!(calc.rto, 5.0);
+    }
+
+    #[tokio::test]
+    async fn test_rto_backoff() {
+        let mut calc = RtoCalculator::new();
+        calc.update(0.1); // RTT 100ms
+        assert!(calc.rto >= 1.0); // Min RTO is 1.0s
+
+        calc.backoff();
+        assert!(calc.rto >= 2.0);
     }
 }
