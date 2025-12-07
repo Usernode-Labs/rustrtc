@@ -20,9 +20,9 @@ use p256::{PublicKey, ecdh::EphemeralSecret, elliptic_curve::sec1::ToEncodedPoin
 use rand_core::OsRng;
 use rcgen::generate_simple_self_signed;
 use sha2::{Digest, Sha256};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
-use tokio::sync::{RwLock, mpsc};
+use std::sync::{Arc, Mutex};
+use tokio::sync::mpsc;
 
 use self::handshake::{
     CertificateMessage, ClientHello, ClientKeyExchange, Finished, HandshakeMessage, HandshakeType,
@@ -75,7 +75,7 @@ pub struct SessionKeys {
 
 struct DtlsInner {
     conn: Arc<IceConn>,
-    state: Arc<RwLock<DtlsState>>,
+    state: Arc<Mutex<DtlsState>>,
     state_tx: tokio::sync::watch::Sender<DtlsState>,
     state_rx: tokio::sync::watch::Receiver<DtlsState>,
     handshake_rx_feeder: mpsc::Sender<Bytes>,
@@ -124,8 +124,8 @@ impl fmt::Display for DtlsState {
 }
 
 impl DtlsTransport {
-    pub async fn get_state(&self) -> DtlsState {
-        self.inner.state.read().await.clone()
+    pub fn get_state(&self) -> DtlsState {
+        self.inner.state.lock().unwrap().clone()
     }
 
     pub async fn new(
@@ -144,7 +144,7 @@ impl DtlsTransport {
 
         let inner = Arc::new(DtlsInner {
             conn: conn.clone(),
-            state: Arc::new(RwLock::new(DtlsState::New)),
+            state: Arc::new(Mutex::new(DtlsState::New)),
             state_tx,
             state_rx,
             handshake_rx_feeder,
@@ -177,7 +177,7 @@ impl DtlsTransport {
                 .await
             {
                 warn!("DTLS handshake failed: {}", e);
-                *inner_clone.state.write().await = DtlsState::Failed;
+                *inner_clone.state.lock().unwrap() = DtlsState::Failed;
                 let _ = inner_clone.state_tx.send(DtlsState::Failed);
             }
             // Connected state is set inside handshake now
@@ -196,7 +196,7 @@ impl DtlsTransport {
 
     pub async fn send(&self, data: Bytes) -> Result<()> {
         let crypto = {
-            let state_guard = self.inner.state.read().await;
+            let state_guard = self.inner.state.lock().unwrap();
             if let DtlsState::Connected(crypto, _) = &*state_guard {
                 crypto.clone()
             } else {
@@ -274,7 +274,7 @@ impl DtlsTransport {
     }
 
     pub async fn export_keying_material(&self, label: &str, len: usize) -> Result<Vec<u8>> {
-        let state = self.inner.state.read().await;
+        let state = self.inner.state.lock().unwrap();
         if let DtlsState::Connected(crypto, _) = &*state {
             let seed = [
                 crypto.keys.client_random.as_slice(),
@@ -468,7 +468,7 @@ impl DtlsInner {
                     let description = payload[1];
                     if description == 0 {
                         // CloseNotify
-                        *self.state.write().await = DtlsState::Closed;
+                        *self.state.lock().unwrap() = DtlsState::Closed;
                         let _ = self.state_tx.send(DtlsState::Closed);
                     }
                 }
@@ -990,7 +990,7 @@ impl DtlsInner {
                         "Finished verification failed. Expected {:?}, got {:?}",
                         expected_verify_data, finished.verify_data
                     );
-                    *self.state.write().await = DtlsState::Failed;
+                    *self.state.lock().unwrap() = DtlsState::Failed;
                     return Err(anyhow::anyhow!("Finished verification failed"));
                 } else {
                     trace!("Client Finished verified");
@@ -1058,14 +1058,14 @@ impl DtlsInner {
             if let Some(keys) = &ctx.session_keys {
                 let crypto = create_session_crypto(keys.clone())?;
                 let state = DtlsState::Connected(Arc::new(crypto), ctx.srtp_profile);
-                *self.state.write().await = state.clone();
+                *self.state.lock().unwrap() = state.clone();
                 self.write_epoch.store(ctx.epoch, Ordering::SeqCst);
                 self.write_seq.store(ctx.sequence_number, Ordering::SeqCst);
                 let _ = self.state_tx.send(state);
                 // Clear ephemeral secret as handshake is complete
                 ctx.local_secret = None;
             } else {
-                *self.state.write().await = DtlsState::Failed;
+                *self.state.lock().unwrap() = DtlsState::Failed;
                 let _ = self.state_tx.send(DtlsState::Failed);
                 return Err(anyhow::anyhow!("Session keys not derived"));
             }
@@ -1083,14 +1083,14 @@ impl DtlsInner {
                         "Finished verification failed. Expected {:?}, got {:?}",
                         expected_verify_data, finished.verify_data
                     );
-                    *self.state.write().await = DtlsState::Failed;
+                    *self.state.lock().unwrap() = DtlsState::Failed;
                     return Err(anyhow::anyhow!("Finished verification failed"));
                 } else {
                     if let Some(keys) = &ctx.session_keys {
                         let crypto = create_session_crypto(keys.clone())?;
 
                         let state = DtlsState::Connected(Arc::new(crypto), ctx.srtp_profile);
-                        *self.state.write().await = state.clone();
+                        *self.state.lock().unwrap() = state.clone();
                         self.write_epoch.store(ctx.epoch, Ordering::SeqCst);
                         self.write_seq.store(ctx.sequence_number, Ordering::SeqCst);
                         let _ = self.state_tx.send(state);
@@ -1395,7 +1395,7 @@ impl DtlsInner {
         mut handshake_rx: mpsc::Receiver<Bytes>,
         close_rx: Arc<tokio::sync::Notify>,
     ) -> Result<()> {
-        *self.state.write().await = DtlsState::Handshaking;
+        *self.state.lock().unwrap() = DtlsState::Handshaking;
         let _ = self.state_tx.send(DtlsState::Handshaking);
 
         let mut ctx = HandshakeContext::new();

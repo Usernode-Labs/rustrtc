@@ -993,7 +993,7 @@ impl PeerConnection {
                     } else {
                         warn!(
                             "Failed to export keying material - DTLS state: {}",
-                            dtls_clone.get_state().await
+                            dtls_clone.get_state()
                         );
                     }
 
@@ -2438,16 +2438,6 @@ impl RtpReceiver {
 
     pub fn set_rtx_ssrc(&self, ssrc: u32) {
         *self.rtx_ssrc.lock().unwrap() = Some(ssrc);
-        let transport = self.transport.lock().unwrap().clone();
-        if let Some(transport) = transport {
-            let (tx, mut rx) = mpsc::channel(2000);
-            transport.register_listener_sync(ssrc, tx);
-            tokio::spawn(async move {
-                while let Some(_) = rx.recv().await {
-                    // Drop RTX packets for now
-                }
-            });
-        }
     }
 
     pub fn set_transport(self: &Arc<Self>, transport: Arc<RtpTransport>) {
@@ -2455,16 +2445,6 @@ impl RtpReceiver {
         let (tx, mut rx) = mpsc::channel(2000);
         let ssrc = *self.ssrc.lock().unwrap();
         transport.register_listener_sync(ssrc, tx.clone());
-
-        if let Some(rtx_ssrc) = *self.rtx_ssrc.lock().unwrap() {
-            let (rtx_tx, mut rtx_rx) = mpsc::channel(2000);
-            transport.register_listener_sync(rtx_ssrc, rtx_tx);
-            tokio::spawn(async move {
-                while let Some(_) = rtx_rx.recv().await {
-                    // Drop RTX packets for now
-                }
-            });
-        }
 
         *self.packet_tx.lock().unwrap() = Some(tx);
         let source = self.source.clone();

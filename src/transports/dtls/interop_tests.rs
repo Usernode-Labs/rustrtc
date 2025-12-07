@@ -91,7 +91,7 @@ async fn test_interop_rustrtc_client_webrtc_server() -> Result<()> {
 
     // Check state
     {
-        let state = client_dtls.get_state().await;
+        let state = client_dtls.get_state();
         match state {
             DtlsState::Connected(..) => info!("rustrtc client connected!"),
             _ => panic!("rustrtc client failed to connect, state: {}", state),

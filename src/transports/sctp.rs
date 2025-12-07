@@ -128,6 +128,7 @@ pub struct DataChannel {
     pub ordered: bool,
     pub max_retransmits: Option<u16>,
     pub max_packet_life_time: Option<u16>,
+    pub max_payload_size: usize,
     pub negotiated: bool,
     pub state: AtomicUsize,
     pub next_ssn: AtomicU16,
@@ -841,6 +842,7 @@ impl SctpInner {
                         } else {
                             None
                         },
+                        max_payload_size: None,
                         negotiated: None,
                     };
 
@@ -973,15 +975,16 @@ impl SctpInner {
                 .find_map(|weak_dc| weak_dc.upgrade().filter(|dc| dc.id == channel_id))
         };
 
+        let mut max_payload_size = 1400;
         let (_guard, ssn) = if let Some(dc) = &dc_opt {
             let guard = dc.send_lock.lock().await;
             let ssn = dc.next_ssn.fetch_add(1, Ordering::SeqCst);
+            max_payload_size = dc.max_payload_size;
             (Some(guard), ssn)
         } else {
             (None, 0)
         };
 
-        let max_payload_size = 900; // Safe limit for MTU ~1200
         let total_len = data.len();
 
         if total_len == 0 {
@@ -1145,6 +1148,7 @@ pub struct DataChannelConfig {
     pub ordered: bool,
     pub max_retransmits: Option<u16>,
     pub max_packet_life_time: Option<u16>,
+    pub max_payload_size: Option<usize>,
     pub negotiated: Option<u16>,
 }
 
@@ -1158,6 +1162,7 @@ impl DataChannel {
             ordered: config.ordered,
             max_retransmits: config.max_retransmits,
             max_packet_life_time: config.max_packet_life_time,
+            max_payload_size: config.max_payload_size.unwrap_or(1400),
             negotiated: config.negotiated.is_some(),
             state: AtomicUsize::new(DataChannelState::Connecting as usize),
             next_ssn: AtomicU16::new(0),
