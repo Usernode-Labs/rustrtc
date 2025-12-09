@@ -1,5 +1,4 @@
 use anyhow::Result;
-use rustrtc::transports::ice::IceGathererState;
 use rustrtc::{MediaKind, RtcConfiguration};
 use rustrtc::{PeerConnection, TransceiverDirection};
 use std::sync::Arc;
@@ -39,17 +38,12 @@ async fn interop_ice_dtls_handshake() -> Result<()> {
 
     // 3. RustRTC creates Offer
     // Trigger gathering
-    let _ = rust_pc.create_offer().await?;
+    let _ = rust_pc.create_offer()?;
 
     // Wait for gathering to complete
-    loop {
-        if rust_pc.ice_transport().gather_state().await == IceGathererState::Complete {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
+    rust_pc.wait_for_gathering_complete().await;
 
-    let offer = rust_pc.create_offer().await?;
+    let offer = rust_pc.create_offer()?;
     println!("RustRTC Offer SDP:\n{}", offer.to_sdp_string());
     rust_pc.set_local_description(offer.clone())?;
 
@@ -78,7 +72,7 @@ async fn interop_ice_dtls_handshake() -> Result<()> {
     rust_pc.set_remote_description(rust_answer).await?;
 
     // 7. Wait for connection
-    rust_pc.wait_for_connection().await?;
+    rust_pc.wait_for_connected().await?;
 
     let (done_tx, mut done_rx) = tokio::sync::mpsc::channel::<()>(1);
     let done_tx = Arc::new(done_tx);
@@ -193,17 +187,12 @@ async fn interop_vp8_echo() -> Result<()> {
 
     // 3. RustRTC creates Offer
     // Trigger gathering
-    let _ = rust_pc.create_offer().await?;
+    let _ = rust_pc.create_offer()?;
 
     // Wait for gathering to complete
-    loop {
-        if rust_pc.ice_transport().gather_state().await == IceGathererState::Complete {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
+    rust_pc.wait_for_gathering_complete().await;
 
-    let offer = rust_pc.create_offer().await?;
+    let offer = rust_pc.create_offer()?;
     rust_pc.set_local_description(offer.clone())?;
 
     // Convert RustRTC SDP to WebRTC SDP
@@ -229,7 +218,7 @@ async fn interop_vp8_echo() -> Result<()> {
     rust_pc.set_remote_description(rust_answer).await?;
 
     // Wait for connection
-    rust_pc.wait_for_connection().await?;
+    rust_pc.wait_for_connected().await?;
 
     // 7. Start sending data from RustRTC
     let source_clone = source.clone();
@@ -399,17 +388,12 @@ async fn interop_vp8_echo_with_pli() -> Result<()> {
 
     // 3. RustRTC creates Offer
     // Trigger gathering
-    let _ = rust_pc.create_offer().await?;
+    let _ = rust_pc.create_offer()?;
 
     // Wait for gathering to complete
-    loop {
-        if rust_pc.ice_transport().gather_state().await == IceGathererState::Complete {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
+    rust_pc.wait_for_gathering_complete().await;
 
-    let offer = rust_pc.create_offer().await?;
+    let offer = rust_pc.create_offer()?;
     rust_pc.set_local_description(offer.clone())?;
 
     // Convert RustRTC SDP to WebRTC SDP
@@ -435,7 +419,7 @@ async fn interop_vp8_echo_with_pli() -> Result<()> {
     rust_pc.set_remote_description(rust_answer).await?;
 
     // Wait for connection
-    rust_pc.wait_for_connection().await?;
+    rust_pc.wait_for_connected().await?;
 
     // 7. Start sending data from RustRTC
     let source_clone = source.clone();
@@ -515,17 +499,12 @@ async fn interop_ice_close_triggers_pc_close() -> Result<()> {
     let webrtc_pc = api.new_peer_connection(webrtc_config).await?;
 
     // 3. RustRTC creates Offer
-    let _ = rust_pc.create_offer().await?;
+    let _ = rust_pc.create_offer()?;
 
     // Wait for gathering to complete
-    loop {
-        if rust_pc.ice_transport().gather_state().await == IceGathererState::Complete {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
+    rust_pc.wait_for_gathering_complete().await;
 
-    let offer = rust_pc.create_offer().await?;
+    let offer = rust_pc.create_offer()?;
     rust_pc.set_local_description(offer.clone())?;
 
     let offer_sdp = offer.to_sdp_string();
@@ -548,7 +527,7 @@ async fn interop_ice_close_triggers_pc_close() -> Result<()> {
     rust_pc.set_remote_description(rust_answer).await?;
 
     // 7. Wait for connection
-    rust_pc.wait_for_connection().await?;
+    rust_pc.wait_for_connected().await?;
 
     // 8. Close WebRTC side
     webrtc_pc.close().await?;

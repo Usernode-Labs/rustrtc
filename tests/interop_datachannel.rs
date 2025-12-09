@@ -62,18 +62,18 @@ async fn interop_datachannel_test() -> Result<()> {
 
     // 3. Exchange SDP
     // Trigger gathering on Rust side (create_offer does it)
-    let _ = rust_pc.create_offer().await?;
+    let _ = rust_pc.create_offer()?;
 
     // Wait for gathering to complete (simple way)
     loop {
-        if rust_pc.ice_transport().gather_state().await
+        if rust_pc.ice_transport().gather_state()
             == rustrtc::transports::ice::IceGathererState::Complete
         {
             break;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    let offer = rust_pc.create_offer().await?; // Re-create with candidates
+    let offer = rust_pc.create_offer()?; // Re-create with candidates
     rust_pc.set_local_description(offer.clone())?;
 
     let webrtc_desc = RTCSessionDescription::offer(offer.to_sdp_string())?;
@@ -90,7 +90,7 @@ async fn interop_datachannel_test() -> Result<()> {
     rust_pc.set_remote_description(rust_answer).await?;
 
     println!("Waiting for ICE Connected...");
-    rust_pc.wait_for_connection().await?;
+    rust_pc.wait_for_connected().await?;
     println!("ICE Connected (PeerConnection Connected)");
 
     // 4. Wait for DataChannel to open
@@ -209,16 +209,16 @@ async fn interop_datachannel_dcep_test() -> Result<()> {
     ));
 
     // 3. Exchange SDP
-    let _ = rust_pc.create_offer().await?;
+    let _ = rust_pc.create_offer()?;
     loop {
-        if rust_pc.ice_transport().gather_state().await
+        if rust_pc.ice_transport().gather_state()
             == rustrtc::transports::ice::IceGathererState::Complete
         {
             break;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    let offer = rust_pc.create_offer().await?;
+    let offer = rust_pc.create_offer()?;
     rust_pc.set_local_description(offer.clone())?;
 
     let webrtc_desc = RTCSessionDescription::offer(offer.to_sdp_string())?;
@@ -233,7 +233,7 @@ async fn interop_datachannel_dcep_test() -> Result<()> {
     let rust_answer = rustrtc::SessionDescription::parse(rustrtc::SdpType::Answer, &answer.sdp)?;
     rust_pc.set_remote_description(rust_answer).await?;
 
-    rust_pc.wait_for_connection().await?;
+    rust_pc.wait_for_connected().await?;
 
     // 4. Wait for DataChannel on WebRTC side
     let webrtc_dc = timeout(Duration::from_secs(5), dc_rx.recv())
@@ -318,23 +318,23 @@ async fn interop_datachannel_incoming_test() -> Result<()> {
     let rust_offer = rustrtc::SessionDescription::parse(rustrtc::SdpType::Offer, &offer.sdp)?;
     rust_pc.set_remote_description(rust_offer).await?;
 
-    let _answer = rust_pc.create_answer().await?;
+    let _answer = rust_pc.create_answer()?;
     // Wait for gathering
     loop {
-        if rust_pc.ice_transport().gather_state().await
+        if rust_pc.ice_transport().gather_state()
             == rustrtc::transports::ice::IceGathererState::Complete
         {
             break;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    let answer = rust_pc.create_answer().await?; // Re-create with candidates
+    let answer = rust_pc.create_answer()?; // Re-create with candidates
     rust_pc.set_local_description(answer.clone())?;
 
     let webrtc_answer = RTCSessionDescription::answer(answer.to_sdp_string())?;
     webrtc_pc.set_remote_description(webrtc_answer).await?;
 
-    rust_pc.wait_for_connection().await?;
+    rust_pc.wait_for_connected().await?;
 
     // 4. Wait for DataChannel on RustRTC side via recv()
     println!("Waiting for DataChannel on RustRTC...");

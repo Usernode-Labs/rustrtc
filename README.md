@@ -90,7 +90,7 @@ async fn main() {
     });
 
     // Create an offer
-    let offer = pc.create_offer().await.unwrap();
+    let offer = pc.create_offer().unwrap();
     pc.set_local_description(offer).unwrap();
 
     // Wait for ICE gathering to complete
@@ -136,6 +136,18 @@ let pc = PeerConnection::new(config);
 
 You can run the examples provided in the repository.
 
+### SFU (Selective Forwarding Unit)
+
+A multi-user video conferencing server. It receives media from each participant and forwards it to others.
+
+1. Run the server:
+    ```bash
+    cargo run --example rustrtc_sfu
+    ```
+
+2. Open your browser and navigate to `http://127.0.0.1:8081`. Open multiple tabs/windows to simulate multiple users.
+
+![rustrtcsfu](./rustrtc_sfu.png)
 ### Echo Server
 
 The echo server example demonstrates how to accept a WebRTC connection, receive data on a data channel, and echo it back. It also supports video playback if an IVF file is provided.
@@ -182,6 +194,7 @@ Streams a video file (`examples/static/output.ivf`) via RTP to a UDP port, which
     ```bash
     ffplay -protocol_whitelist file,udp,rtp -i examples/rtp_play.sdp
     ```
+
 
 ## License
 

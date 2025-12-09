@@ -30,15 +30,15 @@ impl IceConn {
         })
     }
 
-    pub async fn set_remote_rtcp_addr(&self, addr: Option<SocketAddr>) {
+    pub fn set_remote_rtcp_addr(&self, addr: Option<SocketAddr>) {
         *self.remote_rtcp_addr.write().unwrap() = addr;
     }
 
-    pub async fn set_dtls_receiver(&self, receiver: Arc<dyn PacketReceiver>) {
+    pub fn set_dtls_receiver(&self, receiver: Arc<dyn PacketReceiver>) {
         *self.dtls_receiver.write().unwrap() = Some(Arc::downgrade(&receiver));
     }
 
-    pub async fn set_rtp_receiver(&self, receiver: Arc<dyn PacketReceiver>) {
+    pub fn set_rtp_receiver(&self, receiver: Arc<dyn PacketReceiver>) {
         *self.rtp_receiver.write().unwrap() = Some(Arc::downgrade(&receiver));
     }
 
@@ -218,7 +218,7 @@ mod tests {
         let rtcp_addr = rtcp_receiver.local_addr().unwrap();
 
         let conn = IceConn::new(rx, rtp_addr);
-        conn.set_remote_rtcp_addr(Some(rtcp_addr)).await;
+        conn.set_remote_rtcp_addr(Some(rtcp_addr));
 
         // Send RTP (via send) -> should go to rtp_addr
         conn.send(b"rtp").await.unwrap();

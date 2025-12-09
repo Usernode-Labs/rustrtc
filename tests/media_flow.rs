@@ -36,27 +36,27 @@ async fn test_media_flow_and_pli() -> Result<()> {
     // Exchange SDP
     // 1. PC1 Create Offer
     // Trigger gathering
-    let _ = pc1.create_offer().await?;
+    let _ = pc1.create_offer()?;
     // Wait for gathering
     pc1.wait_for_gathering_complete().await;
 
-    let offer = pc1.create_offer().await?;
+    let offer = pc1.create_offer()?;
     pc1.set_local_description(offer.clone())?;
     pc2.set_remote_description(offer).await?;
 
     // 2. PC2 Create Answer
     // Trigger gathering
-    let _ = pc2.create_answer().await?;
+    let _ = pc2.create_answer()?;
     // Wait for gathering
     pc2.wait_for_gathering_complete().await;
 
-    let answer = pc2.create_answer().await?;
+    let answer = pc2.create_answer()?;
     pc2.set_local_description(answer.clone())?;
     pc1.set_remote_description(answer).await?;
 
     // Wait for connection
-    let t1 = pc1.wait_for_connection();
-    let t2 = pc2.wait_for_connection();
+    let t1 = pc1.wait_for_connected();
+    let t2 = pc2.wait_for_connected();
     tokio::try_join!(t1, t2)?;
 
     println!("Connected!");

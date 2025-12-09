@@ -70,7 +70,7 @@ async fn run_single_iteration() -> Option<u128> {
     let _ = pc1.create_data_channel("bench", None);
 
     // Exchange SDP
-    let offer = match pc1.create_offer().await {
+    let offer = match pc1.create_offer() {
         Ok(o) => o,
         Err(_) => return None,
     };
@@ -87,7 +87,7 @@ async fn run_single_iteration() -> Option<u128> {
         return None;
     }
 
-    let answer = match pc2.create_answer().await {
+    let answer = match pc2.create_answer() {
         Ok(a) => a,
         Err(_) => return None,
     };
@@ -107,8 +107,8 @@ async fn run_single_iteration() -> Option<u128> {
     // Wait for connection
     let conn_start = Instant::now();
 
-    let fut1 = pc1.wait_for_connection();
-    let fut2 = pc2.wait_for_connection();
+    let fut1 = pc1.wait_for_connected();
+    let fut2 = pc2.wait_for_connected();
 
     let res = tokio::join!(
         tokio::time::timeout(Duration::from_secs(5), fut1),

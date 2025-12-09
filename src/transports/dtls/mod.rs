@@ -162,7 +162,7 @@ impl DtlsTransport {
         });
 
         // Register with IceConn
-        conn.set_dtls_receiver(transport.clone()).await;
+        conn.set_dtls_receiver(transport.clone());
 
         let inner_clone = inner.clone();
         let runner = async move {
@@ -273,7 +273,7 @@ impl DtlsTransport {
             .map_err(|e| anyhow::anyhow!("Send failed: {}", e))
     }
 
-    pub async fn export_keying_material(&self, label: &str, len: usize) -> Result<Vec<u8>> {
+    pub fn export_keying_material(&self, label: &str, len: usize) -> Result<Vec<u8>> {
         let state = self.inner.state.lock().unwrap();
         if let DtlsState::Connected(crypto, _) = &*state {
             let seed = [

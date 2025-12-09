@@ -199,7 +199,7 @@ async fn session(
         return axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
 
-    let answer = match pc.create_answer().await {
+    let answer = match pc.create_answer() {
         Ok(a) => a,
         Err(e) => {
             warn!("Failed to create answer: {}", e);
@@ -708,7 +708,7 @@ async fn handle_chat_datachannel(
                                                 continue;
                                             }
 
-                                            let answer = match peer_clone.pc.create_answer().await {
+                                            let answer = match peer_clone.pc.create_answer() {
                                                 Ok(a) => a,
                                                 Err(e) => {
                                                     warn!("Failed to create answer from DC: {}", e);
@@ -840,7 +840,7 @@ async fn negotiate(peer: &Peer) {
 
     peer.negotiation_pending.store(false, Ordering::SeqCst);
 
-    match peer.pc.create_offer().await {
+    match peer.pc.create_offer() {
         Ok(offer) => {
             info!(
                 "Created offer for {}, sending via DC. SDP:\n{}",

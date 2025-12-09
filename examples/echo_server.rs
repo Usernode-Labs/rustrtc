@@ -192,12 +192,12 @@ async fn handle_rustrtc_offer(payload: OfferRequest) -> Json<OfferResponse> {
         }
     }
     // Create answer and wait for gathering
-    let _ = pc.create_answer().await.unwrap();
+    let _ = pc.create_answer().unwrap();
 
     // Wait for gathering to complete
     pc.wait_for_gathering_complete().await;
 
-    let answer = pc.create_answer().await.unwrap();
+    let answer = pc.create_answer().unwrap();
     pc.set_local_description(answer.clone()).unwrap();
 
     Json(OfferResponse {
@@ -441,7 +441,7 @@ async fn start_video_playback(pc: PeerConnection, vp8_pt: u8) {
         let sample_source = sample_source.clone();
         let pc_clone = pc.clone();
         tokio::spawn(async move {
-            if let Err(e) = pc_clone.wait_for_connection().await {
+            if let Err(e) = pc_clone.wait_for_connected().await {
                 warn!("Peer connection failed: {}", e);
                 return;
             }

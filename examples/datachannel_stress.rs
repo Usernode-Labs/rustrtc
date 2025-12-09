@@ -53,12 +53,12 @@ async fn offer(Json(payload): Json<OfferRequest>) -> impl IntoResponse {
     pc.set_remote_description(offer_sdp).await.unwrap();
 
     // Create answer
-    let _ = pc.create_answer().await.unwrap();
+    let _ = pc.create_answer().unwrap();
 
     // Wait for gathering to complete (simple approach for example)
     pc.wait_for_gathering_complete().await;
 
-    let answer = pc.create_answer().await.unwrap();
+    let answer = pc.create_answer().unwrap();
     pc.set_local_description(answer.clone()).unwrap();
 
     let pc_clone = pc.clone();

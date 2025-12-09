@@ -31,7 +31,7 @@ async fn builder_starts_gathering() {
     tokio::spawn(runner);
     tokio::time::sleep(Duration::from_millis(50)).await;
     assert!(matches!(
-        transport.gather_state().await,
+        transport.gather_state(),
         IceGathererState::Complete
     ));
 }
@@ -47,7 +47,7 @@ async fn stun_probe_yields_server_reflexive_candidate() -> Result<()> {
     let (socket_tx, _) = tokio::sync::mpsc::unbounded_channel();
     let gatherer = IceGatherer::new(config, tx, socket_tx);
     gatherer.gather().await?;
-    let candidates = gatherer.local_candidates().await;
+    let candidates = gatherer.local_candidates();
     assert!(
         candidates
             .iter()
@@ -68,7 +68,7 @@ async fn turn_probe_yields_relay_candidate() -> Result<()> {
     let (socket_tx, _) = tokio::sync::mpsc::unbounded_channel();
     let gatherer = IceGatherer::new(config, tx, socket_tx);
     gatherer.gather().await?;
-    let candidates = gatherer.local_candidates().await;
+    let candidates = gatherer.local_candidates();
     assert!(
         candidates
             .iter()
@@ -96,7 +96,7 @@ async fn policy_relay_only_gathers_relay_candidates() -> Result<()> {
     let (socket_tx, _) = tokio::sync::mpsc::unbounded_channel();
     let gatherer = IceGatherer::new(config, tx, socket_tx);
     gatherer.gather().await?;
-    let candidates = gatherer.local_candidates().await;
+    let candidates = gatherer.local_candidates();
 
     assert!(!candidates.is_empty());
     for c in candidates {
@@ -193,21 +193,21 @@ async fn turn_connection_relay_to_host() -> Result<()> {
     let mut rx2 = t2.subscribe_candidates();
 
     // Add existing candidates
-    for c in t1.local_candidates().await {
-        t2.add_remote_candidate(c).await;
+    for c in t1.local_candidates() {
+        t2.add_remote_candidate(c);
     }
-    for c in t2.local_candidates().await {
-        t1.add_remote_candidate(c).await;
+    for c in t2.local_candidates() {
+        t1.add_remote_candidate(c);
     }
 
     tokio::spawn(async move {
         while let Ok(c) = rx1.recv().await {
-            t2.add_remote_candidate(c).await;
+            t2.add_remote_candidate(c);
         }
     });
     tokio::spawn(async move {
         while let Ok(c) = rx2.recv().await {
-            t1.add_remote_candidate(c).await;
+            t1.add_remote_candidate(c);
         }
     });
 
@@ -216,12 +216,8 @@ async fn turn_connection_relay_to_host() -> Result<()> {
     let state2 = transport2.subscribe_state();
 
     // Start
-    transport1
-        .start(transport2.local_parameters().await)
-        .await?;
-    transport2
-        .start(transport1.local_parameters().await)
-        .await?;
+    transport1.start(transport2.local_parameters())?;
+    transport2.start(transport1.local_parameters())?;
 
     // Wait for Connected
     let wait_connected = |mut state: watch::Receiver<IceTransportState>, name: &'static str| async move {

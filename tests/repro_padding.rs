@@ -2,7 +2,6 @@ use anyhow::Result;
 use bytes::Bytes;
 use rustrtc::media::MediaStreamTrack;
 use rustrtc::media::frame::{MediaSample, VideoFrame, VideoPixelFormat};
-use rustrtc::transports::ice::IceGathererState;
 use rustrtc::{MediaKind, RtcConfiguration};
 use rustrtc::{PeerConnection, TransceiverDirection};
 use std::sync::Arc;
@@ -46,11 +45,11 @@ async fn test_padding_packet_drop() -> Result<()> {
     // 3. Negotiate
     // PC1 Create Offer
     println!("PC1 Create Offer");
-    let _ = pc1.create_offer().await?; // Trigger gathering
+    let _ = pc1.create_offer()?; // Trigger gathering
     println!("PC1 Wait Gathering");
-    wait_for_gathering(&pc1).await;
+    pc1.wait_for_gathering_complete().await;
     println!("PC1 Create Offer 2");
-    let offer = pc1.create_offer().await?;
+    let offer = pc1.create_offer()?;
     pc1.set_local_description(offer.clone())?;
 
     // PC2 Set Remote Offer
@@ -78,11 +77,11 @@ async fn test_padding_packet_drop() -> Result<()> {
 
     // PC2 Create Answer
     println!("PC2 Create Answer");
-    let _ = pc2.create_answer().await?; // Trigger gathering
+    let _ = pc2.create_answer()?; // Trigger gathering
     println!("PC2 Wait Gathering");
-    wait_for_gathering(&pc2).await;
+    pc2.wait_for_gathering_complete().await;
     println!("PC2 Create Answer 2");
-    let answer = pc2.create_answer().await?;
+    let answer = pc2.create_answer()?;
     pc2.set_local_description(answer.clone())?;
 
     // PC1 Set Remote Answer
@@ -107,9 +106,9 @@ async fn test_padding_packet_drop() -> Result<()> {
 
     // 6. Send Packets from PC1
     println!("PC1 Wait Connection");
-    pc1.wait_for_connection().await?;
+    pc1.wait_for_connected().await?;
     println!("PC2 Wait Connection");
-    pc2.wait_for_connection().await?;
+    pc2.wait_for_connected().await?;
 
     // Packet 1: Valid
     println!("Sending P1");
@@ -213,13 +212,4 @@ async fn test_padding_packet_drop() -> Result<()> {
     pc2.close();
 
     Ok(())
-}
-
-async fn wait_for_gathering(pc: &PeerConnection) {
-    loop {
-        if pc.ice_transport().gather_state().await == IceGathererState::Complete {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
 }

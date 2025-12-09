@@ -122,7 +122,7 @@ async fn test_simulcast_ingest_and_switch() -> Result<()> {
     rust_pc.set_remote_description(rust_offer).await?;
 
     // 5. RustRTC creates Answer
-    let answer = rust_pc.create_answer().await?;
+    let answer = rust_pc.create_answer()?;
     rust_pc.set_local_description(answer.clone())?;
 
     // Convert RustRTC SDP to WebRTC SDP
@@ -134,7 +134,7 @@ async fn test_simulcast_ingest_and_switch() -> Result<()> {
     webrtc_pc.set_remote_description(webrtc_answer).await?;
 
     // 7. Wait for connection
-    rust_pc.wait_for_connection().await?;
+    rust_pc.wait_for_connected().await?;
 
     // 8. Start sending data from WebRTC
     let video_track_clone = video_track.clone();

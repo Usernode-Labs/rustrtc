@@ -1,5 +1,4 @@
 use anyhow::Result;
-use rustrtc::transports::ice::IceGathererState;
 use rustrtc::{PeerConnection, PeerConnectionEvent, RtcConfiguration};
 use std::sync::Arc;
 use std::time::Duration;
@@ -71,15 +70,10 @@ async fn interop_datachannel_stress_test() -> Result<()> {
     rust_pc.set_remote_description(rust_offer).await?;
 
     // RustRTC creates Answer
-    let _ = rust_pc.create_answer().await?;
+    let _ = rust_pc.create_answer()?;
     // Wait for gathering
-    loop {
-        if rust_pc.ice_transport().gather_state().await == IceGathererState::Complete {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-    let answer = rust_pc.create_answer().await?;
+    rust_pc.wait_for_gathering_complete().await;
+    let answer = rust_pc.create_answer()?;
     rust_pc.set_local_description(answer.clone())?;
     // println!("RustRTC Answer SDP:\n{}", answer.to_sdp_string());
 

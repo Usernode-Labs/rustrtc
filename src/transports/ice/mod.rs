@@ -46,7 +46,7 @@ struct IceTransportInner {
     selected_pair: std::sync::Mutex<Option<IceCandidatePair>>,
     local_candidates: Mutex<Vec<IceCandidate>>,
     remote_candidates: std::sync::Mutex<Vec<IceCandidate>>,
-    gather_state: Mutex<IceGathererState>,
+    gather_state: std::sync::Mutex<IceGathererState>,
     config: RtcConfiguration,
     gatherer: IceGatherer,
     local_parameters: std::sync::Mutex<IceParameters>,
@@ -139,9 +139,9 @@ impl IceTransportRunner {
                                 }
                                 {
                                     let mut buffer = inner.local_candidates.lock().await;
-                                    *buffer = inner.gatherer.local_candidates().await;
+                                    *buffer = inner.gatherer.local_candidates();
                                 }
-                                *inner.gather_state.lock().await = IceGathererState::Complete;
+                                *inner.gather_state.lock().unwrap() = IceGathererState::Complete;
                                 let _ = inner.gathering_state.send(IceGathererState::Complete);
                             });
                         }
@@ -256,7 +256,7 @@ impl IceTransportRunner {
             // Send Keepalive
             let pair_opt = inner.selected_pair.lock().unwrap().clone();
             if let Some(pair) = pair_opt {
-                if let Some(socket) = resolve_socket(inner, &pair).await {
+                if let Some(socket) = resolve_socket(inner, &pair) {
                     let tx_id = random_bytes::<12>();
                     let mut msg = StunMessage::binding_request(tx_id, Some("rustrtc"));
 
@@ -320,7 +320,7 @@ impl IceTransport {
             selected_pair: std::sync::Mutex::new(None),
             local_candidates: Mutex::new(Vec::new()),
             remote_candidates: std::sync::Mutex::new(Vec::new()),
-            gather_state: Mutex::new(IceGathererState::New),
+            gather_state: std::sync::Mutex::new(IceGathererState::New),
             config,
             gatherer,
             local_parameters: std::sync::Mutex::new(IceParameters::generate()),
@@ -373,23 +373,23 @@ impl IceTransport {
         self.inner.selected_pair_notifier.subscribe()
     }
 
-    pub async fn gather_state(&self) -> IceGathererState {
-        self.inner.gatherer.state().await
+    pub fn gather_state(&self) -> IceGathererState {
+        self.inner.gatherer.state()
     }
 
     pub async fn role(&self) -> IceRole {
         *self.inner.role.lock().unwrap()
     }
 
-    pub async fn local_candidates(&self) -> Vec<IceCandidate> {
-        self.inner.gatherer.local_candidates().await
+    pub fn local_candidates(&self) -> Vec<IceCandidate> {
+        self.inner.gatherer.local_candidates()
     }
 
-    pub async fn remote_candidates(&self) -> Vec<IceCandidate> {
+    pub fn remote_candidates(&self) -> Vec<IceCandidate> {
         self.inner.remote_candidates.lock().unwrap().clone()
     }
 
-    pub async fn local_parameters(&self) -> IceParameters {
+    pub fn local_parameters(&self) -> IceParameters {
         self.inner.local_parameters.lock().unwrap().clone()
     }
 
@@ -397,9 +397,9 @@ impl IceTransport {
         // Handled by runner
     }
 
-    pub async fn start_gathering(&self) -> Result<()> {
+    pub fn start_gathering(&self) -> Result<()> {
         {
-            let mut state = self.inner.gather_state.lock().await;
+            let mut state = self.inner.gather_state.lock().unwrap();
             if *state == IceGathererState::Complete || *state == IceGathererState::Gathering {
                 return Ok(());
             }
@@ -411,8 +411,8 @@ impl IceTransport {
         Ok(())
     }
 
-    pub async fn start(&self, remote: IceParameters) -> Result<()> {
-        self.start_gathering().await?;
+    pub fn start(&self, remote: IceParameters) -> Result<()> {
+        self.start_gathering()?;
         self.start_keepalive();
         {
             let mut params = self.inner.remote_parameters.lock().unwrap();
@@ -426,12 +426,12 @@ impl IceTransport {
     }
 
     pub async fn start_direct(&self, remote_addr: SocketAddr) -> Result<()> {
-        self.start_gathering().await?;
+        self.start_gathering()?;
         self.start_keepalive();
 
         // Wait for at least one local candidate
         let mut rx = self.subscribe_candidates();
-        let local = if let Some(first) = self.inner.gatherer.local_candidates().await.first() {
+        let local = if let Some(first) = self.inner.gatherer.local_candidates().first() {
             first.clone()
         } else {
             // Wait for one
@@ -446,7 +446,7 @@ impl IceTransport {
 
         *self.inner.selected_pair.lock().unwrap() = Some(pair.clone());
         let _ = self.inner.selected_pair_notifier.send(Some(pair.clone()));
-        if let Some(socket) = resolve_socket(&self.inner, &pair).await {
+        if let Some(socket) = resolve_socket(&self.inner, &pair) {
             let _ = self.inner.selected_socket.send(Some(socket));
         }
         let _ = self.inner.state.send(IceTransportState::Connected);
@@ -457,21 +457,21 @@ impl IceTransport {
         let _ = self.inner.state.send(IceTransportState::Closed);
     }
 
-    pub async fn set_role(&self, role: IceRole) {
+    pub fn set_role(&self, role: IceRole) {
         *self.inner.role.lock().unwrap() = role;
     }
 
-    pub async fn add_remote_candidate(&self, candidate: IceCandidate) {
+    pub fn add_remote_candidate(&self, candidate: IceCandidate) {
         let mut list = self.inner.remote_candidates.lock().unwrap();
         list.push(candidate);
         drop(list);
         self.try_connectivity_checks();
     }
 
-    pub async fn select_pair(&self, pair: IceCandidatePair) {
+    pub fn select_pair(&self, pair: IceCandidatePair) {
         *self.inner.selected_pair.lock().unwrap() = Some(pair.clone());
         let _ = self.inner.selected_pair_notifier.send(Some(pair.clone()));
-        if let Some(socket) = resolve_socket(&self.inner, &pair).await {
+        if let Some(socket) = resolve_socket(&self.inner, &pair) {
             let _ = self.inner.selected_socket.send(Some(socket));
         }
         let _ = self.inner.state.send(IceTransportState::Connected);
@@ -484,7 +484,7 @@ impl IceTransport {
     pub async fn get_selected_socket(&self) -> Option<IceSocketWrapper> {
         let pair = self.inner.selected_pair.lock().unwrap().clone()?;
         if pair.local.typ == IceCandidateType::Relay {
-            let clients = self.inner.gatherer.turn_clients.lock().await;
+            let clients = self.inner.gatherer.turn_clients.lock().unwrap();
             clients
                 .get(&pair.local.address)
                 .map(|c| IceSocketWrapper::Turn(c.clone(), pair.local.address))
@@ -492,7 +492,6 @@ impl IceTransport {
             self.inner
                 .gatherer
                 .get_socket(pair.local.base_address())
-                .await
                 .map(IceSocketWrapper::Udp)
         }
     }
@@ -584,7 +583,7 @@ async fn perform_connectivity_checks_async(inner: Arc<IceTransportInner>) {
     if state != IceTransportState::Checking {
         return;
     }
-    let locals = inner.gatherer.local_candidates().await;
+    let locals = inner.gatherer.local_candidates();
     let remotes = inner.remote_candidates.lock().unwrap().clone();
     let role = *inner.role.lock().unwrap();
 
@@ -663,7 +662,7 @@ async fn perform_connectivity_checks_async(inner: Arc<IceTransportInner>) {
         if let Some(pair) = res {
             *inner.selected_pair.lock().unwrap() = Some(pair.clone());
             let _ = inner.selected_pair_notifier.send(Some(pair.clone()));
-            if let Some(socket) = resolve_socket(&inner, &pair).await {
+            if let Some(socket) = resolve_socket(&inner, &pair) {
                 let _ = inner.selected_socket.send(Some(socket));
             }
             let _ = inner.state.send(IceTransportState::Connected);
@@ -707,17 +706,14 @@ async fn perform_connectivity_checks_async(inner: Arc<IceTransportInner>) {
     }
 }
 
-async fn resolve_socket(
-    inner: &IceTransportInner,
-    pair: &IceCandidatePair,
-) -> Option<IceSocketWrapper> {
+fn resolve_socket(inner: &IceTransportInner, pair: &IceCandidatePair) -> Option<IceSocketWrapper> {
     if pair.local.typ == IceCandidateType::Relay {
-        let clients = inner.gatherer.turn_clients.lock().await;
+        let clients = inner.gatherer.turn_clients.lock().unwrap();
         clients
             .get(&pair.local.address)
             .map(|c| IceSocketWrapper::Turn(c.clone(), pair.local.address))
     } else {
-        let socket = inner.gatherer.get_socket(pair.local.base_address()).await;
+        let socket = inner.gatherer.get_socket(pair.local.base_address());
         if socket.is_none() {
             warn!(
                 "resolve_socket: failed to find socket for {}",
@@ -865,7 +861,7 @@ async fn handle_stun_request(
                 IceSocketWrapper::Turn(_, addr) => *addr,
             };
 
-            let locals = inner.gatherer.local_candidates().await;
+            let locals = inner.gatherer.local_candidates();
             let local_cand = locals.iter().find(|c| c.address == local_addr);
 
             let pair = {
@@ -885,7 +881,7 @@ async fn handle_stun_request(
                 );
                 *inner.selected_pair.lock().unwrap() = Some(pair.clone());
                 let _ = inner.selected_pair_notifier.send(Some(pair.clone()));
-                if let Some(socket) = resolve_socket(&inner, &pair).await {
+                if let Some(socket) = resolve_socket(&inner, &pair) {
                     let _ = inner.selected_socket.send(Some(socket));
                 }
                 let _ = inner.state.send(IceTransportState::Connected);
@@ -966,11 +962,11 @@ async fn perform_binding_check(
 
     let (socket, turn_client) = if local.typ == IceCandidateType::Relay {
         let gatherer = &inner.gatherer;
-        let clients = gatherer.turn_clients.lock().await;
+        let clients = gatherer.turn_clients.lock().unwrap();
         let client = clients.get(&local.address).cloned();
         (None, client)
     } else {
-        let socket = inner.gatherer.get_socket(local.base_address()).await;
+        let socket = inner.gatherer.get_socket(local.base_address());
         (socket, None)
     };
 
@@ -1381,23 +1377,20 @@ impl IceTransportBuilder {
         let mut config = self.config.clone();
         config.ice_servers.extend(self.servers);
         let (transport, runner) = IceTransport::new(config);
-        let task_transport = transport.clone();
-        tokio::spawn(async move {
-            task_transport.set_role(self.role).await;
-            if let Err(err) = task_transport.start_gathering().await {
-                warn!("ICE gather failed: {}", err);
-            }
-        });
+        transport.set_role(self.role);
+        if let Err(err) = transport.start_gathering() {
+            warn!("ICE gather failed: {}", err);
+        }
         (transport, runner)
     }
 }
 
 #[derive(Debug, Clone)]
 struct IceGatherer {
-    state: Arc<Mutex<IceGathererState>>,
-    local_candidates: Arc<Mutex<Vec<IceCandidate>>>,
-    sockets: Arc<Mutex<Vec<Arc<UdpSocket>>>>,
-    turn_clients: Arc<Mutex<HashMap<SocketAddr, Arc<TurnClient>>>>,
+    state: Arc<std::sync::Mutex<IceGathererState>>,
+    local_candidates: Arc<std::sync::Mutex<Vec<IceCandidate>>>,
+    sockets: Arc<std::sync::Mutex<Vec<Arc<UdpSocket>>>>,
+    turn_clients: Arc<std::sync::Mutex<HashMap<SocketAddr, Arc<TurnClient>>>>,
     config: RtcConfiguration,
     candidate_tx: broadcast::Sender<IceCandidate>,
     socket_tx: tokio::sync::mpsc::UnboundedSender<IceSocketWrapper>,
@@ -1410,26 +1403,26 @@ impl IceGatherer {
         socket_tx: tokio::sync::mpsc::UnboundedSender<IceSocketWrapper>,
     ) -> Self {
         Self {
-            state: Arc::new(Mutex::new(IceGathererState::New)),
-            local_candidates: Arc::new(Mutex::new(Vec::new())),
-            sockets: Arc::new(Mutex::new(Vec::new())),
-            turn_clients: Arc::new(Mutex::new(HashMap::new())),
+            state: Arc::new(std::sync::Mutex::new(IceGathererState::New)),
+            local_candidates: Arc::new(std::sync::Mutex::new(Vec::new())),
+            sockets: Arc::new(std::sync::Mutex::new(Vec::new())),
+            turn_clients: Arc::new(std::sync::Mutex::new(HashMap::new())),
             config,
             candidate_tx,
             socket_tx,
         }
     }
 
-    async fn state(&self) -> IceGathererState {
-        *self.state.lock().await
+    fn state(&self) -> IceGathererState {
+        *self.state.lock().unwrap()
     }
 
-    async fn local_candidates(&self) -> Vec<IceCandidate> {
-        self.local_candidates.lock().await.clone()
+    fn local_candidates(&self) -> Vec<IceCandidate> {
+        self.local_candidates.lock().unwrap().clone()
     }
 
-    async fn get_socket(&self, addr: SocketAddr) -> Option<Arc<UdpSocket>> {
-        let sockets = self.sockets.lock().await;
+    fn get_socket(&self, addr: SocketAddr) -> Option<Arc<UdpSocket>> {
+        let sockets = self.sockets.lock().unwrap();
         for socket in sockets.iter() {
             if let Ok(local) = socket.local_addr() {
                 if local == addr {
@@ -1459,7 +1452,7 @@ impl IceGatherer {
     #[instrument(skip(self))]
     async fn gather(&self) -> Result<()> {
         {
-            let mut state = self.state.lock().await;
+            let mut state = self.state.lock().unwrap();
             if *state == IceGathererState::Complete {
                 return Ok(());
             }
@@ -1482,7 +1475,7 @@ impl IceGatherer {
 
         tokio::join!(host_fut, server_fut);
 
-        *self.state.lock().await = IceGathererState::Complete;
+        *self.state.lock().unwrap() = IceGathererState::Complete;
         Ok(())
     }
 
@@ -1493,9 +1486,9 @@ impl IceGatherer {
             Ok(socket) => {
                 if let Ok(addr) = socket.local_addr() {
                     let socket = Arc::new(socket);
-                    self.sockets.lock().await.push(socket.clone());
+                    self.sockets.lock().unwrap().push(socket.clone());
                     let _ = self.socket_tx.send(IceSocketWrapper::Udp(socket));
-                    self.push_candidate(IceCandidate::host(addr, 1)).await;
+                    self.push_candidate(IceCandidate::host(addr, 1));
                 }
             }
             Err(e) => warn!("Failed to bind loopback socket: {}", e),
@@ -1509,9 +1502,9 @@ impl IceGatherer {
                 Ok(socket) => {
                     if let Ok(addr) = socket.local_addr() {
                         let socket = Arc::new(socket);
-                        self.sockets.lock().await.push(socket.clone());
+                        self.sockets.lock().unwrap().push(socket.clone());
                         let _ = self.socket_tx.send(IceSocketWrapper::Udp(socket));
-                        self.push_candidate(IceCandidate::host(addr, 1)).await;
+                        self.push_candidate(IceCandidate::host(addr, 1));
                     }
                 }
                 Err(e) => warn!("Failed to bind LAN socket on {}: {}", ip, e),
@@ -1543,14 +1536,14 @@ impl IceGatherer {
                         IceUriKind::Stun => {
                             if this.config.ice_transport_policy == IceTransportPolicy::All {
                                 match this.probe_stun(&uri).await {
-                                    Ok(Some(candidate)) => this.push_candidate(candidate).await,
+                                    Ok(Some(candidate)) => this.push_candidate(candidate),
                                     Ok(None) => {}
                                     Err(e) => warn!("STUN probe failed for {}: {}", url, e),
                                 }
                             }
                         }
                         IceUriKind::Turn => match this.probe_turn(&uri, &server).await {
-                            Ok(Some(candidate)) => this.push_candidate(candidate).await,
+                            Ok(Some(candidate)) => this.push_candidate(candidate),
                             Ok(None) => {}
                             Err(e) => warn!("TURN probe failed for {}: {}", url, e),
                         },
@@ -1582,7 +1575,7 @@ impl IceGatherer {
         let parsed = StunMessage::decode(&buf[..len])?;
         if let Some(mapped) = parsed.xor_mapped_address {
             let socket = Arc::new(socket);
-            self.sockets.lock().await.push(socket.clone());
+            self.sockets.lock().unwrap().push(socket.clone());
             let _ = self.socket_tx.send(IceSocketWrapper::Udp(socket));
             return Ok(Some(IceCandidate::server_reflexive(local_addr, mapped, 1)));
         }
@@ -1602,7 +1595,7 @@ impl IceGatherer {
         let client = Arc::new(client);
         self.turn_clients
             .lock()
-            .await
+            .unwrap()
             .insert(relayed_addr, client.clone());
         let _ = self
             .socket_tx
@@ -1615,11 +1608,11 @@ impl IceGatherer {
         )))
     }
 
-    async fn push_candidate(&self, candidate: IceCandidate) {
+    fn push_candidate(&self, candidate: IceCandidate) {
         if self.config.disable_ipv6 && candidate.address.is_ipv6() {
             return;
         }
-        let mut candidates = self.local_candidates.lock().await;
+        let mut candidates = self.local_candidates.lock().unwrap();
         if candidates.iter().any(|c| c.address == candidate.address) {
             return;
         }

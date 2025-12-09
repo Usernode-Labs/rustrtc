@@ -104,19 +104,19 @@ async fn interop_turn_datachannel_test() -> Result<()> {
         .await?;
 
     // 4. Exchange SDP
-    let _ = rust_pc.create_offer().await?;
+    let _ = rust_pc.create_offer()?;
 
     // Wait for gathering to complete
     loop {
-        if rust_pc.ice_transport().gather_state().await == rustrtc::IceGathererState::Complete {
+        if rust_pc.ice_transport().gather_state() == rustrtc::IceGathererState::Complete {
             break;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    let offer = rust_pc.create_offer().await?;
+    let offer = rust_pc.create_offer()?;
 
     // Verify we have relay candidates
-    let candidates = rust_pc.ice_transport().local_candidates().await;
+    let candidates = rust_pc.ice_transport().local_candidates();
     println!("RustRTC gathered candidates:");
     for c in &candidates {
         println!("  {:?} {} {}", c.typ, c.address, c.transport);
@@ -140,7 +140,7 @@ async fn interop_turn_datachannel_test() -> Result<()> {
     rust_pc.set_remote_description(rust_answer).await?;
 
     println!("Waiting for ICE Connected...");
-    rust_pc.wait_for_connection().await?;
+    rust_pc.wait_for_connected().await?;
     println!("ICE Connected");
 
     // Check selected pair

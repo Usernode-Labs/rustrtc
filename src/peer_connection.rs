@@ -226,7 +226,7 @@ impl PeerConnection {
         self.inner.transceivers.lock().unwrap().clone()
     }
 
-    pub async fn create_offer(&self) -> RtcResult<SessionDescription> {
+    pub fn create_offer(&self) -> RtcResult<SessionDescription> {
         let state = &self.inner.signaling_state;
         if *state.borrow() != SignalingState::Stable {
             return Err(RtcError::InvalidState(format!(
@@ -243,15 +243,12 @@ impl PeerConnection {
         if should_set_controlling {
             self.inner
                 .ice_transport
-                .set_role(crate::transports::ice::IceRole::Controlling)
-                .await;
+                .set_role(crate::transports::ice::IceRole::Controlling);
         }
-        self.inner
-            .build_description(SdpType::Offer, |dir| dir)
-            .await
+        self.inner.build_description(SdpType::Offer, |dir| dir)
     }
 
-    pub async fn create_answer(&self) -> RtcResult<SessionDescription> {
+    pub fn create_answer(&self) -> RtcResult<SessionDescription> {
         let state = &self.inner.signaling_state;
         if *state.borrow() != SignalingState::HaveRemoteOffer {
             return Err(RtcError::InvalidState(
@@ -260,11 +257,9 @@ impl PeerConnection {
         }
         self.inner
             .ice_transport
-            .set_role(crate::transports::ice::IceRole::Controlled)
-            .await;
+            .set_role(crate::transports::ice::IceRole::Controlled);
         self.inner
             .build_description(SdpType::Answer, |dir| dir.answer_direction())
-            .await
     }
 
     pub fn set_local_description(&self, desc: SessionDescription) -> RtcResult<()> {
@@ -424,14 +419,10 @@ impl PeerConnection {
                 self.inner
                     .ice_transport
                     .start(params)
-                    .await
                     .map_err(|e| crate::RtcError::Internal(format!("ICE error: {}", e)))?;
 
                 for candidate in candidates {
-                    self.inner
-                        .ice_transport
-                        .add_remote_candidate(candidate)
-                        .await;
+                    self.inner.ice_transport.add_remote_candidate(candidate);
                 }
             }
         } else if let Some(addr) = remote_addr {
@@ -694,7 +685,7 @@ impl PeerConnection {
             };
 
             if let Some(addr) = rtcp_addr {
-                ice_conn.set_remote_rtcp_addr(Some(addr)).await;
+                ice_conn.set_remote_rtcp_addr(Some(addr));
                 debug!("RTCP-MUX not detected, setting RTCP address to {}", addr);
             }
         }
@@ -809,8 +800,7 @@ impl PeerConnection {
             let state = state_rx.borrow().clone();
             match state {
                 crate::transports::dtls::DtlsState::Connected(_, profile_opt) => {
-                    self.setup_srtp(&dtls_clone, is_client, profile_opt, &rtp_transport_clone)
-                        .await;
+                    self.setup_srtp(&dtls_clone, is_client, profile_opt, &rtp_transport_clone);
 
                     let rtcp_loop = Self::create_rtcp_loop(
                         rtp_transport_clone.clone(),
@@ -867,7 +857,7 @@ impl PeerConnection {
         Ok(Box::pin(async {}))
     }
 
-    async fn setup_srtp(
+    fn setup_srtp(
         &self,
         dtls: &DtlsTransport,
         is_client: bool,
@@ -893,10 +883,7 @@ impl PeerConnection {
 
         let total_len = 2 * (key_len + salt_len);
 
-        if let Ok(mat) = dtls
-            .export_keying_material("EXTRACTOR-dtls_srtp", total_len)
-            .await
-        {
+        if let Ok(mat) = dtls.export_keying_material("EXTRACTOR-dtls_srtp", total_len) {
             let client_key = &mat[0..key_len];
             let server_key = &mat[key_len..2 * key_len];
             let client_salt = &mat[2 * key_len..2 * key_len + salt_len];
@@ -1052,7 +1039,7 @@ impl PeerConnection {
         self.inner.peer_state.subscribe()
     }
 
-    pub async fn wait_for_connection(&self) -> RtcResult<()> {
+    pub async fn wait_for_connected(&self) -> RtcResult<()> {
         let mut peer_state_rx = self.subscribe_peer_state();
         loop {
             let state = *peer_state_rx.borrow_and_update();
@@ -1088,44 +1075,7 @@ impl PeerConnection {
     }
 
     pub fn close(&self) {
-        let _ = self.inner.signaling_state.send(SignalingState::Closed);
-        let _ = self.inner.peer_state.send(PeerConnectionState::Closed);
-        let _ = self
-            .inner
-            .ice_connection_state
-            .send(IceConnectionState::Closed);
-        let _ = self
-            .inner
-            .ice_gathering_state
-            .send(IceGatheringState::Complete);
-
-        // Send RTCP BYE if possible
-        let rtp_transport = self.inner.rtp_transport.lock().unwrap().clone();
-        if let Some(transport) = rtp_transport {
-            let transceivers = self.inner.transceivers.lock().unwrap();
-            let mut ssrcs = Vec::new();
-            for t in transceivers.iter() {
-                if let Some(sender) = t.sender() {
-                    ssrcs.push(sender.ssrc());
-                }
-            }
-            if !ssrcs.is_empty() {
-                let bye = crate::rtp::RtcpPacket::Goodbye(crate::rtp::Goodbye {
-                    sources: ssrcs,
-                    reason: Some("PeerConnection closed".to_string()),
-                });
-                let transport_clone = transport.clone();
-                tokio::spawn(async move {
-                    let _ = transport_clone.send_rtcp(&[bye]).await;
-                });
-            }
-        }
-
-        if let Some(dtls) = self.inner.dtls_transport.lock().unwrap().as_ref() {
-            dtls.close();
-        }
-
-        self.inner.ice_transport.stop();
+        self.inner.close();
     }
 
     pub async fn recv(&self) -> Option<PeerConnectionEvent> {
@@ -1249,11 +1199,8 @@ impl PeerConnection {
         self.inner.ice_transport.subscribe_candidates()
     }
 
-    pub async fn add_ice_candidate(&self, candidate: IceCandidate) -> RtcResult<()> {
-        self.inner
-            .ice_transport
-            .add_remote_candidate(candidate)
-            .await;
+    pub fn add_ice_candidate(&self, candidate: IceCandidate) -> RtcResult<()> {
+        self.inner.ice_transport.add_remote_candidate(candidate);
         Ok(())
     }
 }
@@ -1279,7 +1226,7 @@ async fn run_gathering_loop(
             if let Some(inner) = inner_weak.upgrade() {
                 let mut updated = false;
                 if inner.config.transport_mode == TransportMode::WebRtc {
-                    let candidates = ice_transport.local_candidates().await;
+                    let candidates = ice_transport.local_candidates();
                     let candidate_strs: Vec<String> =
                         candidates.iter().map(|c| c.to_sdp()).collect();
 
@@ -1303,7 +1250,7 @@ async fn run_gathering_loop(
                             if inner.config.transport_mode == TransportMode::WebRtc {
                                 let is_some = inner.local_description.lock().unwrap().is_some();
                                 if is_some {
-                                    let candidates = ice_transport_2.local_candidates().await;
+                                    let candidates = ice_transport_2.local_candidates();
                                     let candidate_strs: Vec<String> =
                                         candidates.iter().map(|c| c.to_sdp()).collect();
 
@@ -1514,7 +1461,7 @@ fn is_ice_disconnected(state: crate::transports::ice::IceTransportState) -> bool
 }
 
 impl PeerConnectionInner {
-    async fn build_description<F>(
+    fn build_description<F>(
         &self,
         sdp_type: SdpType,
         map_direction: F,
@@ -1577,20 +1524,18 @@ impl PeerConnectionInner {
 
         self.ice_transport
             .start_gathering()
-            .await
             .map_err(|err| RtcError::InvalidState(format!("ICE gathering failed: {err}")))?;
-        let ice_params = self.ice_transport.local_parameters().await;
+        let ice_params = self.ice_transport.local_parameters();
         let ice_username = ice_params.username_fragment.clone();
         let ice_password = ice_params.password.clone();
         let candidate_lines: Vec<String> = self
             .ice_transport
             .local_candidates()
-            .await
             .iter()
             .map(IceCandidate::to_sdp)
             .collect();
         let gather_complete = matches!(
-            self.ice_transport.gather_state().await,
+            self.ice_transport.gather_state(),
             IceGathererState::Complete
         );
         let mut desc = SessionDescription::new(sdp_type);
@@ -1659,7 +1604,7 @@ impl PeerConnectionInner {
                 }
             } else {
                 // For RTP/SRTP, use the first candidate's address for c= and m= port
-                if let Some(first_cand) = self.ice_transport.local_candidates().await.first() {
+                if let Some(first_cand) = self.ice_transport.local_candidates().first() {
                     section.port = first_cand.address.port();
                     section.connection = Some(format!("IN IP4 {}", first_cand.address.ip()));
                 }
@@ -1809,12 +1754,50 @@ impl PeerConnectionInner {
         }
         (None, None)
     }
+
+    fn close(&self) {
+        if *self.peer_state.borrow() == PeerConnectionState::Closed {
+            return;
+        }
+        let _ = self.signaling_state.send(SignalingState::Closed);
+        let _ = self.peer_state.send(PeerConnectionState::Closed);
+        let _ = self.ice_connection_state.send(IceConnectionState::Closed);
+        let _ = self.ice_gathering_state.send(IceGatheringState::Complete);
+
+        // Send RTCP BYE if possible
+        let rtp_transport = self.rtp_transport.lock().unwrap().clone();
+        if let Some(transport) = rtp_transport {
+            let transceivers = self.transceivers.lock().unwrap();
+            let mut ssrcs = Vec::new();
+            for t in transceivers.iter() {
+                if let Some(sender) = t.sender() {
+                    ssrcs.push(sender.ssrc());
+                }
+            }
+            if !ssrcs.is_empty() {
+                let bye = crate::rtp::RtcpPacket::Goodbye(crate::rtp::Goodbye {
+                    sources: ssrcs,
+                    reason: Some("PeerConnection closed".to_string()),
+                });
+                let transport_clone = transport.clone();
+                tokio::spawn(async move {
+                    let _ = transport_clone.send_rtcp(&[bye]).await;
+                });
+            }
+        }
+
+        if let Some(dtls) = self.dtls_transport.lock().unwrap().as_ref() {
+            dtls.close();
+        }
+
+        self.ice_transport.stop();
+    }
 }
 
 impl Drop for PeerConnectionInner {
     fn drop(&mut self) {
         debug!("PeerConnectionInner dropped, stopping ICE transport");
-        self.ice_transport.stop();
+        self.close();
     }
 }
 
@@ -2556,13 +2539,13 @@ mod tests {
         transceiver.set_sender(Some(sender));
 
         // First create_offer triggers gathering
-        let _ = pc.create_offer().await.unwrap();
+        let _ = pc.create_offer().unwrap();
 
         // Wait for gathering to complete to ensure we have candidates and end-of-candidates
         pc.wait_for_gathering_complete().await;
 
         // Create offer again to get the candidates
-        let offer = pc.create_offer().await.unwrap();
+        let offer = pc.create_offer().unwrap();
 
         assert_eq!(offer.media_sections.len(), 1);
         let section = &offer.media_sections[0];
@@ -2599,7 +2582,7 @@ mod tests {
     async fn offer_includes_video_capabilities() {
         let pc = PeerConnection::new(RtcConfiguration::default());
         pc.add_transceiver(MediaKind::Video, TransceiverDirection::SendRecv);
-        let offer = pc.create_offer().await.unwrap();
+        let offer = pc.create_offer().unwrap();
         let section = &offer.media_sections[0];
         assert_eq!(section.kind, MediaKind::Video);
         assert_eq!(section.formats, vec![VIDEO_PAYLOAD_TYPE.to_string()]);
@@ -2619,7 +2602,7 @@ mod tests {
     async fn offer_includes_application_capabilities() {
         let pc = PeerConnection::new(RtcConfiguration::default());
         pc.add_transceiver(MediaKind::Application, TransceiverDirection::SendRecv);
-        let offer = pc.create_offer().await.unwrap();
+        let offer = pc.create_offer().unwrap();
         let section = &offer.media_sections[0];
         assert_eq!(section.kind, MediaKind::Application);
         assert_eq!(section.protocol, "UDP/DTLS/SCTP");
@@ -2750,7 +2733,7 @@ mod tests {
     async fn set_local_description_transitions_state() {
         let pc = PeerConnection::new(RtcConfiguration::default());
         pc.add_transceiver(MediaKind::Audio, TransceiverDirection::SendRecv);
-        let offer = pc.create_offer().await.unwrap();
+        let offer = pc.create_offer().unwrap();
         pc.set_local_description(offer.clone()).unwrap();
         assert_eq!(pc.signaling_state(), SignalingState::HaveLocalOffer);
 
@@ -2764,12 +2747,12 @@ mod tests {
     async fn create_answer_requires_remote_offer() {
         let pc = PeerConnection::new(RtcConfiguration::default());
         pc.add_transceiver(MediaKind::Video, TransceiverDirection::SendOnly);
-        let err = pc.create_answer().await.unwrap_err();
+        let err = pc.create_answer().unwrap_err();
         assert!(matches!(err, RtcError::InvalidState(_)));
 
-        let offer = pc.create_offer().await.unwrap();
+        let offer = pc.create_offer().unwrap();
         pc.set_remote_description(offer.clone()).await.unwrap();
-        let answer = pc.create_answer().await.unwrap();
+        let answer = pc.create_answer().unwrap();
         assert_eq!(answer.media_sections.len(), 1);
         assert_eq!(answer.media_sections[0].direction, Direction::RecvOnly);
         pc.set_local_description(answer).unwrap();
@@ -2780,7 +2763,7 @@ mod tests {
     async fn remote_answer_without_local_offer_is_error() {
         let pc = PeerConnection::new(RtcConfiguration::default());
         pc.add_transceiver(MediaKind::Audio, TransceiverDirection::RecvOnly);
-        let mut fake_answer = pc.create_offer().await.unwrap();
+        let mut fake_answer = pc.create_offer().unwrap();
         fake_answer.sdp_type = SdpType::Answer;
         let err = pc.set_remote_description(fake_answer).await.unwrap_err();
         assert!(matches!(err, RtcError::InvalidState(_)));
@@ -2802,7 +2785,7 @@ mod tests {
         let pc = PeerConnection::new(config);
         pc.add_transceiver(MediaKind::Audio, TransceiverDirection::SendRecv);
 
-        let offer = pc.create_offer().await.unwrap();
+        let offer = pc.create_offer().unwrap();
         let section = &offer.media_sections[0];
 
         // Should NOT have ICE attributes
@@ -2824,7 +2807,7 @@ mod tests {
         let pc = PeerConnection::new(config);
         pc.add_transceiver(MediaKind::Audio, TransceiverDirection::SendRecv);
 
-        let offer = pc.create_offer().await.unwrap();
+        let offer = pc.create_offer().unwrap();
         let section = &offer.media_sections[0];
 
         // Should NOT have ICE attributes
