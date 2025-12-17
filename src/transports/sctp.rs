@@ -263,6 +263,57 @@ struct SctpCleanupGuard<'a> {
     inner: &'a SctpInner,
 }
 
+/// Build Gap Ack Blocks from buffered out-of-order packets so the peer knows
+/// exactly which TSNs we have received beyond the cumulative ack. We limit the
+/// number of blocks to keep the SACK compact and stay within 16-bit offsets.
+fn build_gap_ack_blocks_from_map(
+    received: &BTreeMap<u32, (u8, Bytes)>,
+    cumulative_tsn_ack: u32,
+) -> Vec<(u16, u16)> {
+    let mut blocks: Vec<(u16, u16)> = Vec::new();
+    let mut current: Option<(u32, u32)> = None;
+
+    for &tsn in received.keys() {
+        // Ignore any TSN that is already cumulatively acked or would wrap.
+        if tsn <= cumulative_tsn_ack {
+            continue;
+        }
+
+        match current {
+            Some((start, end)) if tsn == end.wrapping_add(1) => {
+                current = Some((start, tsn));
+            }
+            Some((start, end)) => {
+                let start_off = start.wrapping_sub(cumulative_tsn_ack);
+                let end_off = end.wrapping_sub(cumulative_tsn_ack);
+                if start_off <= u16::MAX as u32 && end_off <= u16::MAX as u32 {
+                    blocks.push((start_off as u16, end_off as u16));
+                }
+                current = Some((tsn, tsn));
+            }
+            None => {
+                current = Some((tsn, tsn));
+            }
+        }
+
+        if blocks.len() >= 16 {
+            break; // keep SACK compact
+        }
+    }
+
+    if blocks.len() < 16 {
+        if let Some((start, end)) = current {
+            let start_off = start.wrapping_sub(cumulative_tsn_ack);
+            let end_off = end.wrapping_sub(cumulative_tsn_ack);
+            if start_off <= u16::MAX as u32 && end_off <= u16::MAX as u32 {
+                blocks.push((start_off as u16, end_off as u16));
+            }
+        }
+    }
+
+    blocks
+}
+
 impl<'a> Drop for SctpCleanupGuard<'a> {
     fn drop(&mut self) {
         *self.inner.state.lock().unwrap() = SctpState::Closed;
@@ -1134,12 +1185,27 @@ impl SctpInner {
         Ok(())
     }
 
+    /// Build Gap Ack Blocks from buffered out-of-order packets so the peer knows
+    /// exactly which TSNs we have received beyond the cumulative ack. We limit
+    /// the number of blocks to keep the SACK compact and stay within 16-bit
+    /// offsets.
+    fn build_gap_ack_blocks(&self, cumulative_tsn_ack: u32) -> Vec<(u16, u16)> {
+        let received = self.received_queue.lock().unwrap();
+        build_gap_ack_blocks_from_map(&received, cumulative_tsn_ack)
+    }
+
     async fn send_sack(&self, cumulative_tsn_ack: u32) -> Result<()> {
         let mut sack = BytesMut::new();
         sack.put_u32(cumulative_tsn_ack); // Cumulative TSN Ack
         sack.put_u32(1024 * 1024); // a_rwnd
-        sack.put_u16(0); // Number of Gap Ack Blocks
-        sack.put_u16(0); // Number of Duplicate TSNs
+        let gap_blocks = self.build_gap_ack_blocks(cumulative_tsn_ack);
+        sack.put_u16(gap_blocks.len() as u16); // Number of Gap Ack Blocks
+        sack.put_u16(0); // Number of Duplicate TSNs (not tracked yet)
+
+        for (start, end) in &gap_blocks {
+            sack.put_u16(*start);
+            sack.put_u16(*end);
+        }
 
         let tag = self.remote_verification_tag.load(Ordering::SeqCst);
         self.send_chunk(CT_SACK, 0, sack.freeze(), tag).await
@@ -1534,6 +1600,7 @@ impl DataChannel {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
 
     #[test]
     fn test_rto_calculator() {
@@ -1570,5 +1637,48 @@ mod tests {
 
         calc.backoff();
         assert!(calc.rto >= 2.0);
+    }
+
+    #[test]
+    fn test_gap_ack_blocks_contiguous_and_gaps() {
+        let mut received: BTreeMap<u32, (u8, Bytes)> = BTreeMap::new();
+        // cumulative ack is 10; we have 12-13 contiguous and 15 isolated
+        received.insert(12, (0, Bytes::new()));
+        received.insert(13, (0, Bytes::new()));
+        received.insert(15, (0, Bytes::new()));
+
+        let blocks = build_gap_ack_blocks_from_map(&received, 10);
+        assert_eq!(blocks, vec![(2, 3), (5, 5)]);
+    }
+
+    #[test]
+    fn test_gap_ack_blocks_limit_to_16() {
+        let mut received: BTreeMap<u32, (u8, Bytes)> = BTreeMap::new();
+        // Build more than 16 small gaps; we should cap at 16 blocks
+        let cumulative = 1;
+        for i in 0..20 {
+            // Place isolated TSNs two apart to force separate blocks
+            let tsn = cumulative + 2 + i * 2;
+            received.insert(tsn, (0, Bytes::new()));
+        }
+
+        let blocks = build_gap_ack_blocks_from_map(&received, cumulative);
+        assert_eq!(blocks.len(), 16);
+        // First block should start at offset 1 (tsn 3) and every block single TSN
+        assert_eq!(blocks[0], (2, 2));
+    }
+
+    #[test]
+    fn test_gap_ack_blocks_ignore_acked_or_wrapped() {
+        let mut received: BTreeMap<u32, (u8, Bytes)> = BTreeMap::new();
+        // Below or equal cumulative should be ignored
+        received.insert(5, (0, Bytes::new()));
+        received.insert(6, (0, Bytes::new()));
+        // Valid ones after cumulative
+        received.insert(8, (0, Bytes::new()));
+        received.insert(9, (0, Bytes::new()));
+
+        let blocks = build_gap_ack_blocks_from_map(&received, 6);
+        assert_eq!(blocks, vec![(2, 3)]);
     }
 }
