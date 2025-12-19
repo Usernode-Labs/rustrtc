@@ -1715,6 +1715,14 @@ impl PeerConnectionInner {
         );
         let mut desc = SessionDescription::new(sdp_type);
         desc.session.origin = default_origin();
+        if let Some(ext_ip) = &self.config.external_ip {
+            desc.session.origin.unicast_address = ext_ip.clone();
+            desc.session.origin.address_type = if ext_ip.contains(':') {
+                crate::sdp::AddressType::Ipv6
+            } else {
+                crate::sdp::AddressType::Ipv4
+            };
+        }
         desc.session.origin.session_version += 1;
         if !desc
             .session
@@ -1729,6 +1737,18 @@ impl PeerConnectionInner {
         }
 
         let mode = self.config.transport_mode.clone();
+
+        // Pre-calculate the primary local IP for RTP/SRTP modes to ensure consistency
+        let primary_local_ip = if mode == TransportMode::Rtp || mode == TransportMode::Srtp {
+            if let Some(ext_ip) = &self.config.external_ip {
+                ext_ip.parse().ok()
+            } else {
+                get_local_ip().ok()
+            }
+        } else {
+            None
+        };
+
         for transceiver in ordered_transceivers.into_iter() {
             let mid = self.ensure_mid(&transceiver);
             let mut direction = map_direction(transceiver.direction());
@@ -1780,9 +1800,28 @@ impl PeerConnectionInner {
                 }
             } else {
                 // For RTP/SRTP, use the first candidate's address for c= and m= port
-                if let Some(first_cand) = self.ice_transport.local_candidates().first() {
-                    section.port = first_cand.address.port();
-                    section.connection = Some(format!("IN IP4 {}", first_cand.address.ip()));
+                // Prefer candidate matching our primary IP, then any non-loopback
+                let candidates = self.ice_transport.local_candidates();
+                let best_cand = if let Some(target_ip) = primary_local_ip {
+                    candidates
+                        .iter()
+                        .find(|c| c.address.ip() == target_ip)
+                        .or_else(|| candidates.iter().find(|c| !c.address.ip().is_loopback()))
+                        .or_else(|| candidates.first())
+                } else {
+                    candidates
+                        .iter()
+                        .find(|c| !c.address.ip().is_loopback())
+                        .or_else(|| candidates.first())
+                };
+
+                if let Some(cand) = best_cand {
+                    section.port = cand.address.port();
+                    let cand_ip = cand.address.ip();
+                    // Only add media-level c= if it differs from the session-level primary_local_ip
+                    if Some(cand_ip) != primary_local_ip {
+                        section.connection = Some(format!("IN IP4 {}", cand_ip));
+                    }
                 }
             }
 
@@ -1818,7 +1857,7 @@ impl PeerConnectionInner {
         }
 
         if mode == TransportMode::Rtp || mode == TransportMode::Srtp {
-            let local_ip = get_local_ip().unwrap_or(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)));
+            let local_ip = primary_local_ip.unwrap_or(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)));
             if desc.session.connection.is_none() {
                 desc.session.connection = Some(format!("IN IP4 {}", local_ip));
             }
