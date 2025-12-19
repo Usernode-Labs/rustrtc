@@ -1,5 +1,7 @@
 use crate::media::track::{MediaStreamTrack, SampleStreamSource, SampleStreamTrack, sample_track};
-use crate::rtp::{FirRequest, FullIntraRequest, PictureLossIndication, RtcpPacket, RtpPacket};
+use crate::rtp::{
+    FirRequest, FullIntraRequest, GenericNack, PictureLossIndication, RtcpPacket, RtpPacket,
+};
 use crate::stats::{StatsReport, gather_once};
 use crate::stats_collector::StatsCollector;
 use crate::transports::dtls::{self, DtlsTransport};
@@ -9,12 +11,12 @@ use crate::transports::ice::{IceCandidate, IceGathererState, IceTransport, conn:
 use crate::transports::rtp::RtpTransport;
 use crate::transports::sctp::SctpTransport;
 use crate::{
-    Attribute, Direction, MediaKind, MediaSection, Origin, RtcConfiguration, RtcError, RtcResult,
-    SdpType, SessionDescription, TransportMode,
+    Attribute, AudioCapability, Direction, MediaKind, MediaSection, Origin, RtcConfiguration,
+    RtcError, RtcResult, SdpType, SessionDescription, TransportMode, VideoCapability,
 };
 use base64::prelude::*;
 use rand_core::{OsRng, RngCore};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::{IpAddr, Ipv4Addr};
 use std::{
     sync::{
@@ -24,13 +26,200 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::{broadcast, mpsc, watch};
-use tracing::{debug, info, trace, warn};
+use tracing::{debug, trace, warn};
 // use tracing::{debug, trace, warn};
 
+use async_trait::async_trait;
 use futures::stream::{FuturesUnordered, StreamExt};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Weak;
+
+#[async_trait]
+pub trait RtpSenderInterceptor: Send + Sync {
+    async fn on_packet_sent(&self, _packet: &RtpPacket) {}
+    async fn on_rtcp_received(&self, _packet: &RtcpPacket, _transport: Arc<RtpTransport>) {}
+    fn as_nack_stats(self: Arc<Self>) -> Option<Arc<dyn NackStats>> {
+        None
+    }
+}
+
+#[async_trait]
+pub trait RtpReceiverInterceptor: Send + Sync {
+    async fn on_packet_received(&self, _packet: &RtpPacket) -> Option<RtcpPacket> {
+        None
+    }
+    async fn on_rtcp_received(&self, _packet: &RtcpPacket, _transport: Arc<RtpTransport>) {}
+    fn as_nack_stats(self: Arc<Self>) -> Option<Arc<dyn NackStats>> {
+        None
+    }
+}
+
+pub trait NackStats: Send + Sync {
+    fn get_nack_count(&self) -> u64;
+    fn get_recovered_count(&self) -> u64 {
+        0
+    }
+}
+
+pub struct DefaultRtpSenderNackHandler {
+    buffer: Mutex<VecDeque<RtpPacket>>,
+    max_size: usize,
+    pub nack_recv_count: AtomicU64,
+}
+
+pub struct DefaultRtpSenderBitrateHandler;
+
+impl DefaultRtpSenderBitrateHandler {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+#[async_trait]
+impl RtpSenderInterceptor for DefaultRtpSenderBitrateHandler {
+    async fn on_rtcp_received(&self, packet: &RtcpPacket, _transport: Arc<RtpTransport>) {
+        if let RtcpPacket::RemoteBitrateEstimate(remb) = packet {
+            debug!("Received REMB: {} bps", remb.bitrate_bps);
+        }
+    }
+}
+
+impl DefaultRtpSenderNackHandler {
+    pub fn new(max_size: usize) -> Self {
+        Self {
+            buffer: Mutex::new(VecDeque::with_capacity(max_size)),
+            max_size,
+            nack_recv_count: AtomicU64::new(0),
+        }
+    }
+}
+
+#[async_trait]
+impl RtpSenderInterceptor for DefaultRtpSenderNackHandler {
+    async fn on_packet_sent(&self, packet: &RtpPacket) {
+        let mut buffer = self.buffer.lock().unwrap();
+        buffer.push_back(packet.clone());
+        if buffer.len() > self.max_size {
+            buffer.pop_front();
+        }
+    }
+
+    async fn on_rtcp_received(&self, packet: &RtcpPacket, transport: Arc<RtpTransport>) {
+        if let RtcpPacket::GenericNack(nack) = packet {
+            debug!(
+                "NACK: received NACK for {} packets",
+                nack.lost_packets.len()
+            );
+            self.nack_recv_count
+                .fetch_add(nack.lost_packets.len() as u64, Ordering::Relaxed);
+
+            let to_resend = {
+                let buffer = self.buffer.lock().unwrap();
+                let mut packets = Vec::new();
+                for seq in &nack.lost_packets {
+                    if let Some(packet) = buffer.iter().find(|p| p.header.sequence_number == *seq) {
+                        packets.push(packet.clone());
+                    }
+                }
+                packets
+            };
+
+            for packet in to_resend {
+                let seq_num = packet.header.sequence_number;
+                debug!("NACK: retransmitting packet seq={}", seq_num);
+                let _ = transport.send_rtp(&packet).await;
+            }
+        }
+    }
+
+    fn as_nack_stats(self: Arc<Self>) -> Option<Arc<dyn NackStats>> {
+        Some(self)
+    }
+}
+
+impl NackStats for DefaultRtpSenderNackHandler {
+    fn get_nack_count(&self) -> u64 {
+        self.nack_recv_count.load(Ordering::Relaxed)
+    }
+}
+
+pub struct DefaultRtpReceiverNackHandler {
+    last_seq: AtomicU16,
+    initialized: std::sync::atomic::AtomicBool,
+    pub nack_sent_count: AtomicU64,
+    pub nack_recovered_count: AtomicU64,
+}
+
+impl DefaultRtpReceiverNackHandler {
+    pub fn new() -> Self {
+        Self {
+            last_seq: AtomicU16::new(0),
+            initialized: std::sync::atomic::AtomicBool::new(false),
+            nack_sent_count: AtomicU64::new(0),
+            nack_recovered_count: AtomicU64::new(0),
+        }
+    }
+}
+
+#[async_trait]
+impl RtpReceiverInterceptor for DefaultRtpReceiverNackHandler {
+    async fn on_packet_received(&self, packet: &RtpPacket) -> Option<RtcpPacket> {
+        let seq = packet.header.sequence_number;
+        if !self.initialized.swap(true, Ordering::SeqCst) {
+            self.last_seq.store(seq, Ordering::SeqCst);
+            return None;
+        }
+
+        let last = self.last_seq.load(Ordering::SeqCst);
+        let diff = seq.wrapping_sub(last);
+
+        if diff > 1 && diff < 32768 {
+            let mut lost = Vec::new();
+            let mut s = last.wrapping_add(1);
+            while s != seq {
+                lost.push(s);
+                s = s.wrapping_add(1);
+            }
+            debug!(
+                "NACK: detected gap from {} to {}, lost {} packets",
+                last,
+                seq,
+                lost.len()
+            );
+            self.nack_sent_count
+                .fetch_add(lost.len() as u64, Ordering::Relaxed);
+            self.last_seq.store(seq, Ordering::SeqCst);
+            return Some(RtcpPacket::GenericNack(GenericNack {
+                sender_ssrc: 0, // Will be filled by receiver
+                media_ssrc: packet.header.ssrc,
+                lost_packets: lost,
+            }));
+        }
+
+        if diff < 32768 {
+            self.last_seq.store(seq, Ordering::SeqCst);
+        } else if diff > 32768 {
+            debug!("NACK: received old packet seq={}, last={}", seq, last);
+            self.nack_recovered_count.fetch_add(1, Ordering::Relaxed);
+        }
+        None
+    }
+
+    fn as_nack_stats(self: Arc<Self>) -> Option<Arc<dyn NackStats>> {
+        Some(self)
+    }
+}
+
+impl NackStats for DefaultRtpReceiverNackHandler {
+    fn get_nack_count(&self) -> u64 {
+        self.nack_sent_count.load(Ordering::Relaxed)
+    }
+
+    fn get_recovered_count(&self) -> u64 {
+        self.nack_recovered_count.load(Ordering::Relaxed)
+    }
+}
 
 enum ReceiverCommand {
     AddTrack {
@@ -213,8 +402,38 @@ impl PeerConnection {
         kind: MediaKind,
         direction: TransceiverDirection,
     ) -> Arc<RtpTransceiver> {
+        let mut builder = RtpReceiverBuilder::new(kind, random_u32());
+
+        let nack_enabled = if let Some(caps) = &self.inner.config.media_capabilities {
+            match kind {
+                MediaKind::Audio => caps
+                    .audio
+                    .iter()
+                    .any(|c| c.rtcp_fbs.contains(&"nack".to_string())),
+                MediaKind::Video => caps
+                    .video
+                    .iter()
+                    .any(|c| c.rtcp_fbs.contains(&"nack".to_string())),
+                MediaKind::Application => false,
+            }
+        } else {
+            match kind {
+                MediaKind::Audio => AudioCapability::default()
+                    .rtcp_fbs
+                    .contains(&"nack".to_string()),
+                MediaKind::Video => VideoCapability::default()
+                    .rtcp_fbs
+                    .contains(&"nack".to_string()),
+                MediaKind::Application => false,
+            }
+        };
+
+        if nack_enabled {
+            builder = builder.nack();
+        }
+        let receiver = builder.build();
+
         let transceiver = Arc::new(RtpTransceiver::new(kind, direction));
-        let receiver = Arc::new(RtpReceiver::new(kind, random_u32()));
         *transceiver.receiver.lock().unwrap() = Some(receiver);
 
         let mut list = self.inner.transceivers.lock().unwrap();
@@ -243,7 +462,42 @@ impl PeerConnection {
         };
         let transceiver = self.add_transceiver(kind, TransceiverDirection::SendRecv);
         let ssrc = self.inner.ssrc_generator.fetch_add(1, Ordering::Relaxed);
-        let sender = Arc::new(RtpSender::new(track, ssrc, stream_id, params));
+
+        let mut builder = RtpSenderBuilder::new(track, ssrc)
+            .stream_id(stream_id)
+            .params(params);
+
+        let nack_enabled = if let Some(caps) = &self.inner.config.media_capabilities {
+            match kind {
+                MediaKind::Audio => caps
+                    .audio
+                    .iter()
+                    .any(|c| c.rtcp_fbs.contains(&"nack".to_string())),
+                MediaKind::Video => caps
+                    .video
+                    .iter()
+                    .any(|c| c.rtcp_fbs.contains(&"nack".to_string())),
+                MediaKind::Application => false,
+            }
+        } else {
+            match kind {
+                MediaKind::Audio => AudioCapability::default()
+                    .rtcp_fbs
+                    .contains(&"nack".to_string()),
+                MediaKind::Video => VideoCapability::default()
+                    .rtcp_fbs
+                    .contains(&"nack".to_string()),
+                MediaKind::Application => false,
+            }
+        };
+
+        if nack_enabled {
+            builder = builder
+                .nack(self.inner.config.nack_buffer_size)
+                .bitrate_controller();
+        }
+
+        let sender = builder.build();
 
         // If transport is already established, set it on the sender immediately
         if let Some(transport) = self.inner.rtp_transport.lock().unwrap().as_ref() {
@@ -598,7 +852,40 @@ impl PeerConnection {
                     t.set_mid(mid.clone());
 
                     let receiver_ssrc = ssrc.unwrap_or_else(|| 2000 + transceivers.len() as u32);
-                    let receiver = Arc::new(RtpReceiver::new(kind, receiver_ssrc));
+
+                    let mut builder = RtpReceiverBuilder::new(kind, receiver_ssrc);
+
+                    let nack_enabled = if let Some(caps) = &self.inner.config.media_capabilities {
+                        match kind {
+                            MediaKind::Audio => caps
+                                .audio
+                                .iter()
+                                .any(|c| c.rtcp_fbs.contains(&"nack".to_string())),
+                            MediaKind::Video => caps
+                                .video
+                                .iter()
+                                .any(|c| c.rtcp_fbs.contains(&"nack".to_string())),
+                            _ => false,
+                        }
+                    } else {
+                        match kind {
+                            MediaKind::Audio => AudioCapability::default()
+                                .rtcp_fbs
+                                .contains(&"nack".to_string()),
+                            MediaKind::Video => VideoCapability::default()
+                                .rtcp_fbs
+                                .contains(&"nack".to_string()),
+                            _ => false,
+                        }
+                    };
+
+                    if nack_enabled {
+                        debug!("NACK: enabled for new receiver mid={}", mid);
+                        builder = builder.nack();
+                    } else {
+                        debug!("NACK: disabled for new receiver mid={}", mid);
+                    }
+                    let receiver = builder.build();
                     if let Some(rtx) = rtx_ssrc {
                         receiver.set_rtx_ssrc(rtx);
                     }
@@ -724,11 +1011,6 @@ impl PeerConnection {
             }
         }
 
-        self.inner
-            .ice_transport
-            .set_data_receiver(ice_conn.clone())
-            .await;
-
         let srtp_required = self.config().transport_mode != TransportMode::Rtp;
         let rtp_transport = Arc::new(RtpTransport::new(ice_conn.clone(), srtp_required));
         {
@@ -737,6 +1019,11 @@ impl PeerConnection {
                 as std::sync::Weak<dyn crate::transports::PacketReceiver>);
         }
         *self.inner.rtp_transport.lock().unwrap() = Some(rtp_transport.clone());
+
+        self.inner
+            .ice_transport
+            .set_data_receiver(ice_conn.clone())
+            .await;
 
         // Update receivers immediately to ensure listeners are registered
         {
@@ -751,10 +1038,21 @@ impl PeerConnection {
 
         if self.config().transport_mode == TransportMode::Srtp {
             self.setup_sdes(&rtp_transport)?;
-            return Ok(Box::pin(async {}));
+            let rtcp_loop = Self::create_rtcp_loop(
+                rtp_transport.clone(),
+                Arc::downgrade(&self.inner),
+                self.inner.stats_collector.clone(),
+            );
+            return Ok(Box::pin(rtcp_loop));
         }
 
         if self.config().transport_mode == TransportMode::Rtp {
+            let rtcp_loop = Self::create_rtcp_loop(
+                rtp_transport.clone(),
+                Arc::downgrade(&self.inner),
+                self.inner.stats_collector.clone(),
+            );
+
             let transceivers = self.inner.transceivers.lock().unwrap();
             for t in transceivers.iter() {
                 let sender_arc = t.sender.lock().unwrap().clone();
@@ -777,7 +1075,7 @@ impl PeerConnection {
                     }
                 }
             }
-            return Ok(Box::pin(async {}));
+            return Ok(Box::pin(rtcp_loop));
         }
 
         let (dtls, incoming_data_rx, dtls_runner) = DtlsTransport::new(
@@ -1096,7 +1394,7 @@ impl PeerConnection {
                                 let is_for_sender = match &packet {
                                     RtcpPacket::PictureLossIndication(p) => {
                                         if p.media_ssrc == sender.ssrc() {
-                                            info!("Received PLI for SSRC: {}", p.media_ssrc);
+                                            debug!("Received PLI for SSRC: {}", p.media_ssrc);
                                             true
                                         } else {
                                             false
@@ -1311,6 +1609,7 @@ impl PeerConnection {
     }
 
     pub async fn wait_for_gathering_complete(&self) {
+        let _ = self.inner.ice_transport.start_gathering();
         let mut rx = self.subscribe_ice_gathering_state();
         loop {
             if *rx.borrow_and_update() == IceGatheringState::Complete {
@@ -1717,11 +2016,6 @@ impl PeerConnectionInner {
         desc.session.origin = default_origin();
         if let Some(ext_ip) = &self.config.external_ip {
             desc.session.origin.unicast_address = ext_ip.clone();
-            desc.session.origin.address_type = if ext_ip.contains(':') {
-                crate::sdp::AddressType::Ipv6
-            } else {
-                crate::sdp::AddressType::Ipv4
-            };
         }
         desc.session.origin.session_version += 1;
         if !desc
@@ -1738,16 +2032,18 @@ impl PeerConnectionInner {
 
         let mode = self.config.transport_mode.clone();
 
-        // Pre-calculate the primary local IP for RTP/SRTP modes to ensure consistency
-        let primary_local_ip = if mode == TransportMode::Rtp || mode == TransportMode::Srtp {
-            if let Some(ext_ip) = &self.config.external_ip {
-                ext_ip.parse().ok()
+        if mode == TransportMode::Rtp || mode == TransportMode::Srtp {
+            let local_ip = if let Some(ext_ip) = &self.config.external_ip {
+                ext_ip
+                    .parse()
+                    .unwrap_or(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)))
             } else {
-                get_local_ip().ok()
+                get_local_ip().unwrap_or(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)))
+            };
+            if desc.session.connection.is_none() {
+                desc.session.connection = Some(format!("IN IP4 {}", local_ip));
             }
-        } else {
-            None
-        };
+        }
 
         for transceiver in ordered_transceivers.into_iter() {
             let mid = self.ensure_mid(&transceiver);
@@ -1800,37 +2096,17 @@ impl PeerConnectionInner {
                 }
             } else {
                 // For RTP/SRTP, use the first candidate's address for c= and m= port
-                // Prefer candidate matching our primary IP, then any non-loopback
+                // Prefer non-loopback candidates
                 let candidates = self.ice_transport.local_candidates();
-                let best_cand = if let Some(target_ip) = primary_local_ip {
-                    candidates
-                        .iter()
-                        .find(|c| c.address.ip() == target_ip)
-                        .or_else(|| {
-                            // If we haven't found the target IP yet, try any non-loopback candidate
-                            candidates.iter().find(|c| !c.address.ip().is_loopback())
-                        })
-                        // If target_ip is not loopback, avoid falling back to loopback if possible
-                        .or_else(|| {
-                            if target_ip.is_loopback() {
-                                candidates.first()
-                            } else {
-                                None
-                            }
-                        })
-                } else {
-                    candidates
-                        .iter()
-                        .find(|c| !c.address.ip().is_loopback())
-                        .or_else(|| candidates.first())
-                };
-
-                if let Some(cand) = best_cand {
+                if let Some(cand) = candidates
+                    .iter()
+                    .find(|c| !c.address.ip().is_loopback())
+                    .or(candidates.first())
+                {
                     section.port = cand.address.port();
-                    let cand_ip = cand.address.ip();
-                    // Only add media-level c= if it differs from the session-level primary_local_ip
-                    if Some(cand_ip) != primary_local_ip {
-                        section.connection = Some(format!("IN IP4 {}", cand_ip));
+                    let conn = format!("IN IP4 {}", cand.address.ip());
+                    if Some(&conn) != desc.session.connection.as_ref() {
+                        section.connection = Some(conn);
                     }
                 }
             }
@@ -1864,13 +2140,6 @@ impl PeerConnectionInner {
             }
 
             desc.media_sections.push(section);
-        }
-
-        if mode == TransportMode::Rtp || mode == TransportMode::Srtp {
-            let local_ip = primary_local_ip.unwrap_or(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)));
-            if desc.session.connection.is_none() {
-                desc.session.connection = Some(format!("IN IP4 {}", local_ip));
-            }
         }
 
         if !desc.media_sections.is_empty() {
@@ -2250,14 +2519,87 @@ pub struct RtpSender {
     rtcp_tx: broadcast::Sender<RtcpPacket>,
     stop_tx: Arc<tokio::sync::Notify>,
     next_sequence_number: Arc<AtomicU16>,
+    interceptors: Vec<Arc<dyn RtpSenderInterceptor>>,
+}
+
+pub struct RtpSenderBuilder {
+    track: Arc<dyn MediaStreamTrack>,
+    ssrc: u32,
+    stream_id: String,
+    params: RtpCodecParameters,
+    interceptors: Vec<Arc<dyn RtpSenderInterceptor>>,
+}
+
+impl RtpSenderBuilder {
+    pub fn new(track: Arc<dyn MediaStreamTrack>, ssrc: u32) -> Self {
+        Self {
+            track,
+            ssrc,
+            stream_id: "stream".to_string(),
+            params: RtpCodecParameters::default(),
+            interceptors: Vec::new(),
+        }
+    }
+
+    pub fn stream_id(mut self, id: String) -> Self {
+        self.stream_id = id;
+        self
+    }
+
+    pub fn params(mut self, params: RtpCodecParameters) -> Self {
+        self.params = params;
+        self
+    }
+
+    pub fn nack(mut self, buffer_size: usize) -> Self {
+        self.interceptors
+            .push(Arc::new(DefaultRtpSenderNackHandler::new(buffer_size)));
+        self
+    }
+
+    pub fn bitrate_controller(mut self) -> Self {
+        self.interceptors
+            .push(Arc::new(DefaultRtpSenderBitrateHandler::new()));
+        self
+    }
+
+    pub fn interceptor(mut self, interceptor: Arc<dyn RtpSenderInterceptor>) -> Self {
+        self.interceptors.push(interceptor);
+        self
+    }
+
+    pub fn build(self) -> Arc<RtpSender> {
+        Arc::new(RtpSender::new_internal(
+            self.track,
+            self.ssrc,
+            self.stream_id,
+            self.params,
+            self.interceptors,
+        ))
+    }
 }
 
 impl RtpSender {
+    pub fn builder(track: Arc<dyn MediaStreamTrack>, ssrc: u32) -> RtpSenderBuilder {
+        RtpSenderBuilder::new(track, ssrc)
+    }
+
     pub fn new(
         track: Arc<dyn MediaStreamTrack>,
         ssrc: u32,
         stream_id: String,
         params: RtpCodecParameters,
+        interceptors: Vec<Arc<dyn RtpSenderInterceptor>>,
+    ) -> Self {
+        Self::new_internal(track, ssrc, stream_id, params, interceptors)
+    }
+
+    fn new_internal(
+        track: Arc<dyn MediaStreamTrack>,
+        ssrc: u32,
+        stream_id: String,
+        params: RtpCodecParameters,
+        interceptors: Vec<Arc<dyn RtpSenderInterceptor>>,
     ) -> Self {
         let track_label = track.id().to_string();
         let track_id = Arc::<str>::from(track_label.clone());
@@ -2275,6 +2617,7 @@ impl RtpSender {
             rtcp_tx,
             stop_tx: Arc::new(tokio::sync::Notify::new()),
             next_sequence_number: Arc::new(AtomicU16::new(random_u32() as u16)),
+            interceptors,
         }
     }
 
@@ -2306,6 +2649,19 @@ impl RtpSender {
         self.params.lock().unwrap().clone()
     }
 
+    pub fn interceptors(&self) -> &[Arc<dyn RtpSenderInterceptor>] {
+        &self.interceptors
+    }
+
+    pub fn nack_handler(&self) -> Option<Arc<dyn NackStats>> {
+        for i in &self.interceptors {
+            if let Some(stats) = i.clone().as_nack_stats() {
+                return Some(stats);
+            }
+        }
+        None
+    }
+
     pub fn set_transport(&self, transport: Arc<RtpTransport>) {
         *self.transport.lock().unwrap() = Some(transport.clone());
         let track = self.track.clone();
@@ -2313,6 +2669,8 @@ impl RtpSender {
         let params_lock = self.params.clone();
         let stop_rx = self.stop_tx.clone();
         let next_seq = self.next_sequence_number.clone();
+        let interceptors = self.interceptors.clone();
+        let mut rtcp_rx = self.rtcp_tx.subscribe();
 
         tokio::spawn(async move {
             let mut sequence_number = 0u16;
@@ -2322,6 +2680,16 @@ impl RtpSender {
             loop {
                 tokio::select! {
                     _ = stop_rx.notified() => break,
+                    rtcp = rtcp_rx.recv() => {
+                        match rtcp {
+                            Ok(packet) => {
+                                for interceptor in &interceptors {
+                                    interceptor.on_rtcp_received(&packet, transport.clone()).await;
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
                     res = track.recv() => {
                         match res {
                             Ok(sample) => {
@@ -2373,6 +2741,10 @@ impl RtpSender {
                                 // Rewrite sequence number
                                 packet.header.sequence_number = next_seq.fetch_add(1, Ordering::Relaxed);
 
+                                for interceptor in &interceptors {
+                                    interceptor.on_packet_sent(&packet).await;
+                                }
+
                                 if let Err(e) = transport.send_rtp(&packet).await {
                                     debug!("Failed to send RTP: {}", e);
                                 }
@@ -2419,10 +2791,81 @@ pub struct RtpReceiver {
         >,
     >,
     runner_tx: Mutex<Option<mpsc::UnboundedSender<ReceiverCommand>>>,
+    interceptors: Vec<Arc<dyn RtpReceiverInterceptor>>,
+}
+
+pub struct RtpReceiverBuilder {
+    kind: MediaKind,
+    ssrc: u32,
+    interceptors: Vec<Arc<dyn RtpReceiverInterceptor>>,
+}
+
+impl RtpReceiverBuilder {
+    pub fn new(kind: MediaKind, ssrc: u32) -> Self {
+        Self {
+            kind,
+            ssrc,
+            interceptors: Vec::new(),
+        }
+    }
+
+    pub fn nack(mut self) -> Self {
+        self.interceptors
+            .push(Arc::new(DefaultRtpReceiverNackHandler::new()));
+        self
+    }
+
+    pub fn interceptor(mut self, interceptor: Arc<dyn RtpReceiverInterceptor>) -> Self {
+        self.interceptors.push(interceptor);
+        self
+    }
+
+    pub fn build(self) -> Arc<RtpReceiver> {
+        let media_kind = match self.kind {
+            MediaKind::Audio => crate::media::frame::MediaKind::Audio,
+            MediaKind::Video => crate::media::frame::MediaKind::Video,
+            _ => crate::media::frame::MediaKind::Audio,
+        };
+        let (source, track, feedback_rx) = sample_track(media_kind, 100);
+
+        let params = match self.kind {
+            MediaKind::Audio => RtpCodecParameters {
+                payload_type: 111,
+                clock_rate: 48000,
+                channels: 2,
+            },
+            MediaKind::Video => RtpCodecParameters {
+                payload_type: 96,
+                clock_rate: 90000,
+                channels: 0,
+            },
+            _ => RtpCodecParameters::default(),
+        };
+
+        Arc::new(RtpReceiver {
+            track,
+            source: Arc::new(source),
+            ssrc: Mutex::new(self.ssrc),
+            params: Mutex::new(params),
+            transport: Mutex::new(None),
+            packet_tx: Mutex::new(None),
+            rtcp_feedback_ssrc: Mutex::new(None),
+            rtx_ssrc: Mutex::new(None),
+            fir_seq: AtomicU8::new(0),
+            feedback_rx: Arc::new(tokio::sync::Mutex::new(feedback_rx)),
+            simulcast_tracks: Mutex::new(HashMap::new()),
+            runner_tx: Mutex::new(None),
+            interceptors: self.interceptors,
+        })
+    }
 }
 
 impl RtpReceiver {
-    pub fn new(kind: MediaKind, ssrc: u32) -> Self {
+    pub fn new(
+        kind: MediaKind,
+        ssrc: u32,
+        interceptors: Vec<Arc<dyn RtpReceiverInterceptor>>,
+    ) -> Self {
         let media_kind = match kind {
             MediaKind::Audio => crate::media::frame::MediaKind::Audio,
             MediaKind::Video => crate::media::frame::MediaKind::Video,
@@ -2457,6 +2900,7 @@ impl RtpReceiver {
             feedback_rx: Arc::new(tokio::sync::Mutex::new(feedback_rx)),
             simulcast_tracks: Mutex::new(HashMap::new()),
             runner_tx: Mutex::new(None),
+            interceptors,
         }
     }
 
@@ -2495,6 +2939,15 @@ impl RtpReceiver {
 
     pub fn track(&self) -> Arc<SampleStreamTrack> {
         self.track.clone()
+    }
+
+    pub fn nack_handler(&self) -> Option<Arc<dyn NackStats>> {
+        for i in &self.interceptors {
+            if let Some(stats) = i.clone().as_nack_stats() {
+                return Some(stats);
+            }
+        }
+        None
     }
 
     pub fn simulcast_track(&self, rid: &str) -> Option<Arc<SampleStreamTrack>> {
@@ -2651,6 +3104,24 @@ impl RtpReceiver {
                                         }
 
                                         if let Some(this) = weak_self.upgrade() {
+                                            for interceptor in &this.interceptors {
+                                                if let Some(mut rtcp_packet) = interceptor.on_packet_received(&packet).await {
+                                                    if let RtcpPacket::GenericNack(ref mut nack) = rtcp_packet {
+                                                        let sender_ssrc = this.rtcp_feedback_ssrc.lock().unwrap().unwrap_or(0);
+                                                        if sender_ssrc != 0 {
+                                                            nack.sender_ssrc = sender_ssrc;
+                                                        } else {
+                                                            debug!("NACK: skipping sender_ssrc update because it is 0");
+                                                        }
+                                                    }
+
+                                                    let transport = this.transport.lock().unwrap().clone();
+                                                    if let Some(transport) = transport {
+                                                        let _ = transport.send_rtcp(&[rtcp_packet]).await;
+                                                    }
+                                                }
+                                            }
+
                                             let params = this.params.lock().unwrap().clone();
                                             let sample = crate::media::frame::MediaSample::from_rtp_packet(
                                                 packet,
@@ -2806,7 +3277,10 @@ mod tests {
             clock_rate: 48000,
             channels: 2,
         };
-        let sender = Arc::new(RtpSender::new(track, 12345, "stream".to_string(), params));
+        let sender = RtpSender::builder(track, 12345)
+            .stream_id("stream".to_string())
+            .params(params)
+            .build();
         transceiver.set_sender(Some(sender));
 
         // First create_offer triggers gathering
@@ -3078,7 +3552,10 @@ mod tests {
             clock_rate: 48000,
             channels: 2,
         };
-        let sender = Arc::new(RtpSender::new(track, 12345, "stream".to_string(), params));
+        let sender = RtpSender::builder(track, 12345)
+            .stream_id("stream".to_string())
+            .params(params)
+            .build();
         transceiver.set_sender(Some(sender));
 
         let offer = pc.create_offer().unwrap();
@@ -3260,5 +3737,123 @@ a=ssrc-group:FID 12345 67890\r\n";
 
         let crypto_val = crypto.unwrap().value.as_ref().unwrap();
         assert!(crypto_val.starts_with("1 AES_CM_128_HMAC_SHA1_80 inline:"));
+    }
+
+    #[tokio::test]
+    async fn test_receiver_nack_handler() {
+        use crate::rtp::RtpHeader;
+        let handler = DefaultRtpReceiverNackHandler::new();
+        let mut header = RtpHeader::new(96, 100, 0, 1234);
+        let packet1 = RtpPacket::new(header.clone(), vec![1, 2, 3]);
+
+        // First packet initializes
+        assert!(handler.on_packet_received(&packet1).await.is_none());
+
+        // Consecutive packet
+        header.sequence_number = 101;
+        let packet2 = RtpPacket::new(header.clone(), vec![4, 5, 6]);
+        assert!(handler.on_packet_received(&packet2).await.is_none());
+
+        // Gap detected (102 missing)
+        header.sequence_number = 103;
+        let packet3 = RtpPacket::new(header.clone(), vec![7, 8, 9]);
+        let res = handler
+            .on_packet_received(&packet3)
+            .await
+            .expect("Should generate NACK");
+        if let RtcpPacket::GenericNack(nack) = res {
+            assert_eq!(nack.lost_packets, vec![102]);
+            assert_eq!(nack.media_ssrc, 1234);
+        } else {
+            panic!("Expected GenericNack");
+        }
+
+        // Multiple gap detected (104, 105 missing)
+        header.sequence_number = 106;
+        let packet4 = RtpPacket::new(header.clone(), vec![10]);
+        let res = handler
+            .on_packet_received(&packet4)
+            .await
+            .expect("Should generate NACK");
+        if let RtcpPacket::GenericNack(nack) = res {
+            assert_eq!(nack.lost_packets, vec![104, 105]);
+        } else {
+            panic!("Expected GenericNack");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_sender_nack_handler() {
+        use crate::rtp::RtpHeader;
+        use crate::transports::ice::conn::IceConn;
+        use crate::transports::rtp::RtpTransport;
+        use std::net::{Ipv4Addr, SocketAddr};
+
+        let handler = DefaultRtpSenderNackHandler::new(10);
+        let mut header = RtpHeader::new(96, 100, 0, 1234);
+        let packet1 = RtpPacket::new(header.clone(), vec![1, 2, 3]);
+
+        handler.on_packet_sent(&packet1).await;
+
+        // Mock transport (we just need it to not crash, though it won't actually send)
+        let (_, socket_rx) = tokio::sync::watch::channel(None);
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 1234);
+        let ice_conn = IceConn::new(socket_rx, addr);
+        let transport = Arc::new(RtpTransport::new(ice_conn, false));
+
+        let nack = GenericNack {
+            sender_ssrc: 0,
+            media_ssrc: 1234,
+            lost_packets: vec![100],
+        };
+
+        // This will retransmit
+        handler
+            .on_rtcp_received(&RtcpPacket::GenericNack(nack), transport)
+            .await;
+
+        // Buffer overflow test
+        for i in 101..115 {
+            header.sequence_number = i;
+            handler
+                .on_packet_sent(&RtpPacket::new(header.clone(), vec![0]))
+                .await;
+        }
+
+        // Packet 100 should be gone now (buffer size 10, we sent 14 more)
+        let nack_old = GenericNack {
+            sender_ssrc: 0,
+            media_ssrc: 1234,
+            lost_packets: vec![100],
+        };
+
+        // We can't easily check if it was sent without a mock transport that records sends,
+        // but we can at least verify it doesn't panic and the logic runs.
+        let (_, socket_rx2) = tokio::sync::watch::channel(None);
+        let ice_conn2 = IceConn::new(socket_rx2, addr);
+        let transport2 = Arc::new(RtpTransport::new(ice_conn2, false));
+        handler
+            .on_rtcp_received(&RtcpPacket::GenericNack(nack_old), transport2)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn test_nack_configuration() {
+        let mut config = RtcConfiguration::default();
+        config.nack_buffer_size = 200;
+
+        let pc = PeerConnection::new(config);
+        let transceiver = pc.add_transceiver(MediaKind::Video, TransceiverDirection::SendRecv);
+
+        // Check receiver has handler
+        let receiver = transceiver.receiver().unwrap();
+        assert!(receiver.nack_handler().is_some());
+
+        // Check sender has handler
+        let (_, track, _) = sample_track(crate::media::frame::MediaKind::Video, 90000);
+        let sender = pc
+            .add_track_with_stream_id(track, "stream1".to_string(), RtpCodecParameters::default())
+            .unwrap();
+        assert!(sender.nack_handler().is_some());
     }
 }

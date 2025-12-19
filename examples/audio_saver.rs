@@ -61,6 +61,7 @@ async fn offer(Json(payload): Json<OfferRequest>) -> impl IntoResponse {
             clock_rate: 8000,
             channels: 1,
             fmtp: None,
+            rtcp_fbs: vec![],
         },
         rustrtc::config::AudioCapability {
             payload_type: 111,
@@ -68,6 +69,7 @@ async fn offer(Json(payload): Json<OfferRequest>) -> impl IntoResponse {
             clock_rate: 48000,
             channels: 2,
             fmtp: Some("minptime=10;useinbandfec=1".to_string()),
+            rtcp_fbs: vec![],
         },
     ];
     config.media_capabilities = Some(caps);

@@ -242,16 +242,14 @@ async fn start_echo(pc: PeerConnection, vp8_pt: u8) {
         let (sample_source, outgoing_track, _) = media::sample_track(MediaStreamKind::Video, 120);
 
         let ssrc = 5000 + transceiver.id() as u32;
-        let sender = Arc::new(rustrtc::peer_connection::RtpSender::new(
-            outgoing_track.clone(),
-            ssrc,
-            "stream".to_string(),
-            rustrtc::RtpCodecParameters {
+        let sender = rustrtc::peer_connection::RtpSender::builder(outgoing_track.clone(), ssrc)
+            .stream_id("stream".to_string())
+            .params(rustrtc::RtpCodecParameters {
                 payload_type: vp8_pt,
                 clock_rate: 90000,
                 channels: 0,
-            },
-        ));
+            })
+            .build();
 
         let mut rtcp_rx = sender.subscribe_rtcp();
         let incoming_track_clone = incoming_track.clone();
@@ -423,16 +421,14 @@ async fn start_video_playback(pc: PeerConnection, vp8_pt: u8) {
         let (sample_source, outgoing_track, _) = media::sample_track(MediaStreamKind::Video, 120);
 
         let ssrc = 5000 + transceiver.id() as u32;
-        let sender = Arc::new(rustrtc::peer_connection::RtpSender::new(
-            outgoing_track.clone(),
-            ssrc,
-            "stream".to_string(),
-            rustrtc::RtpCodecParameters {
+        let sender = rustrtc::peer_connection::RtpSender::builder(outgoing_track.clone(), ssrc)
+            .stream_id("stream".to_string())
+            .params(rustrtc::RtpCodecParameters {
                 payload_type: vp8_pt,
                 clock_rate: 90000,
                 channels: 0,
-            },
-        ));
+            })
+            .build();
 
         let mut rtcp_rx = sender.subscribe_rtcp();
         transceiver.set_sender(Some(sender));

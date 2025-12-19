@@ -10,8 +10,9 @@ pub mod stats_collector;
 pub mod transports;
 
 pub use config::{
-    BundlePolicy, CertificateConfig, IceCredentialType, IceServer, IceTransportPolicy,
-    RtcConfiguration, RtcConfigurationBuilder, RtcpMuxPolicy, TransportMode,
+    AudioCapability, BundlePolicy, CertificateConfig, IceCredentialType, IceServer,
+    IceTransportPolicy, RtcConfiguration, RtcConfigurationBuilder, RtcpMuxPolicy, TransportMode,
+    VideoCapability,
 };
 pub use errors::{RtcError, RtcResult, SdpError, SdpResult};
 pub use peer_connection::{

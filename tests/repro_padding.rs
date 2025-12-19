@@ -4,7 +4,6 @@ use rustrtc::media::MediaStreamTrack;
 use rustrtc::media::frame::{MediaSample, VideoFrame, VideoPixelFormat};
 use rustrtc::{MediaKind, RtcConfiguration};
 use rustrtc::{PeerConnection, TransceiverDirection};
-use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::timeout;
 
@@ -30,16 +29,14 @@ async fn test_padding_packet_drop() -> Result<()> {
     // PC1 adds transceiver with sender
     let t1 = pc1.add_transceiver(MediaKind::Video, TransceiverDirection::SendRecv);
 
-    let s1 = Arc::new(rustrtc::peer_connection::RtpSender::new(
-        client_track,
-        11111,
-        "stream".to_string(),
-        rustrtc::RtpCodecParameters {
+    let s1 = rustrtc::peer_connection::RtpSender::builder(client_track, 11111)
+        .stream_id("stream".to_string())
+        .params(rustrtc::RtpCodecParameters {
             payload_type: 96,
             clock_rate: 90000,
             channels: 0,
-        },
-    ));
+        })
+        .build();
     t1.set_sender(Some(s1.clone()));
 
     // 3. Negotiate
@@ -63,16 +60,14 @@ async fn test_padding_packet_drop() -> Result<()> {
     // Create a sender for PC2 to echo back
     let (sample_source, outgoing_track, _) =
         rustrtc::media::sample_track(rustrtc::media::MediaKind::Video, 96);
-    let s2 = Arc::new(rustrtc::peer_connection::RtpSender::new(
-        outgoing_track,
-        55555,
-        "stream".to_string(),
-        rustrtc::RtpCodecParameters {
+    let s2 = rustrtc::peer_connection::RtpSender::builder(outgoing_track, 55555)
+        .stream_id("stream".to_string())
+        .params(rustrtc::RtpCodecParameters {
             payload_type: 96,
             clock_rate: 90000,
             channels: 0,
-        },
-    ));
+        })
+        .build();
     t2.set_sender(Some(s2));
 
     // PC2 Create Answer

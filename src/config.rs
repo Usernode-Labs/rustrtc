@@ -94,6 +94,7 @@ pub struct AudioCapability {
     pub clock_rate: u32,
     pub channels: u8,
     pub fmtp: Option<String>,
+    pub rtcp_fbs: Vec<String>,
 }
 
 impl Default for AudioCapability {
@@ -104,6 +105,7 @@ impl Default for AudioCapability {
             clock_rate: 48000,
             channels: 2,
             fmtp: Some("minptime=10;useinbandfec=1".to_string()),
+            rtcp_fbs: vec!["nack".to_string()],
         }
     }
 }
@@ -120,6 +122,7 @@ impl AudioCapability {
             clock_rate: 8000,
             channels: 1,
             fmtp: None,
+            rtcp_fbs: vec!["nack".to_string()],
         }
     }
 
@@ -130,6 +133,7 @@ impl AudioCapability {
             clock_rate: 8000,
             channels: 1,
             fmtp: None,
+            rtcp_fbs: vec!["nack".to_string()],
         }
     }
 
@@ -140,6 +144,7 @@ impl AudioCapability {
             clock_rate: 8000,
             channels: 1,
             fmtp: None,
+            rtcp_fbs: vec!["nack".to_string()],
         }
     }
 
@@ -150,6 +155,7 @@ impl AudioCapability {
             clock_rate: 8000,
             channels: 1,
             fmtp: Some("0-16".to_string()),
+            rtcp_fbs: vec![],
         }
     }
 }
@@ -168,7 +174,13 @@ impl Default for VideoCapability {
             payload_type: 96,
             codec_name: "VP8".to_string(),
             clock_rate: 90000,
-            rtcp_fbs: vec!["nack pli".to_string(), "transport-cc".to_string()],
+            rtcp_fbs: vec![
+                "nack".to_string(),
+                "nack pli".to_string(),
+                "ccm fir".to_string(),
+                "goog-remb".to_string(),
+                "transport-cc".to_string(),
+            ],
         }
     }
 }
@@ -210,6 +222,7 @@ pub struct RtcConfiguration {
     pub rtcp_mux_policy: RtcpMuxPolicy,
     pub certificates: Vec<CertificateConfig>,
     pub transport_mode: TransportMode,
+    pub nack_buffer_size: usize,
     pub media_capabilities: Option<MediaCapabilities>,
     pub external_ip: Option<String>,
     pub disable_ipv6: bool,
@@ -227,6 +240,7 @@ impl Default for RtcConfiguration {
             rtcp_mux_policy: RtcpMuxPolicy::default(),
             certificates: Vec::new(),
             transport_mode: TransportMode::default(),
+            nack_buffer_size: 200,
             media_capabilities: None,
             external_ip: None,
             disable_ipv6: false,

@@ -121,12 +121,10 @@ async fn interop_vp8_echo() -> Result<()> {
         clock_rate: 90000,
         channels: 0,
     };
-    let sender = Arc::new(rustrtc::peer_connection::RtpSender::new(
-        track,
-        12345,
-        "stream".to_string(),
-        params,
-    ));
+    let sender = rustrtc::peer_connection::RtpSender::builder(track, 12345)
+        .stream_id("stream".to_string())
+        .params(params)
+        .build();
     transceiver.set_sender(Some(sender));
 
     // 2. Create WebRTC PeerConnection (Answerer)
@@ -307,12 +305,10 @@ async fn interop_vp8_echo_with_pli() -> Result<()> {
         clock_rate: 90000,
         channels: 0,
     };
-    let sender = Arc::new(rustrtc::peer_connection::RtpSender::new(
-        track,
-        12345,
-        "stream".to_string(),
-        params,
-    ));
+    let sender = rustrtc::peer_connection::RtpSender::builder(track, 12345)
+        .stream_id("stream".to_string())
+        .params(params)
+        .build();
     transceiver.set_sender(Some(sender));
 
     // 2. Create WebRTC PeerConnection (Answerer)

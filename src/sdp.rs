@@ -622,6 +622,12 @@ impl MediaSection {
                     Some(format!("{} {}", audio.payload_type, fmtp)),
                 ));
             }
+            for fb in &audio.rtcp_fbs {
+                self.attributes.push(Attribute::new(
+                    "rtcp-fb",
+                    Some(format!("{} {}", audio.payload_type, fb)),
+                ));
+            }
         }
     }
 

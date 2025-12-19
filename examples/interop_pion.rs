@@ -4,7 +4,6 @@ use rustrtc::media::{MediaSample, VideoFrame};
 use rustrtc::{PeerConnection, PeerConnectionEvent, RtcConfiguration, SdpType, SessionDescription};
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
-use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::sleep;
 use tracing::info;
@@ -172,16 +171,14 @@ async fn run_client(addr_str: &str) {
 
     // Create Video Track
     let (source, track, _) = rustrtc::media::sample_track(rustrtc::media::MediaKind::Video, 96);
-    let sender = Arc::new(rustrtc::peer_connection::RtpSender::new(
-        track,
-        12345,
-        "stream".to_string(),
-        rustrtc::RtpCodecParameters {
+    let sender = rustrtc::peer_connection::RtpSender::builder(track, 12345)
+        .stream_id("stream".to_string())
+        .params(rustrtc::RtpCodecParameters {
             payload_type: 96,
             clock_rate: 90000,
             channels: 0,
-        },
-    ));
+        })
+        .build();
 
     let transceiver = pc.add_transceiver(
         rustrtc::MediaKind::Video,

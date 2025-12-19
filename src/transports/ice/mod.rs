@@ -1214,7 +1214,11 @@ impl IceCandidate {
     }
 
     pub fn base_address(&self) -> SocketAddr {
-        self.related_address.unwrap_or(self.address)
+        if self.typ == IceCandidateType::ServerReflexive || self.typ == IceCandidateType::Host {
+            self.related_address.unwrap_or(self.address)
+        } else {
+            self.address
+        }
     }
 
     fn server_reflexive(base: SocketAddr, mapped: SocketAddr, component: u16) -> Self {

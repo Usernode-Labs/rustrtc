@@ -34,7 +34,10 @@ mod tests {
             clock_rate: 48000,
             channels: 2,
         };
-        let sender = Arc::new(RtpSender::new(track, 12345, "stream".to_string(), params));
+        let sender = RtpSender::builder(track, 12345)
+            .stream_id("stream".to_string())
+            .params(params)
+            .build();
         sender.set_transport(rtp_transport);
 
         // 4. Send samples with non-continuous sequence numbers
@@ -102,7 +105,10 @@ mod tests {
             clock_rate: 90000,
             channels: 0,
         };
-        let sender = Arc::new(RtpSender::new(track, 12345, "stream".to_string(), params));
+        let sender = RtpSender::builder(track, 12345)
+            .stream_id("stream".to_string())
+            .params(params)
+            .build();
         sender.set_transport(rtp_transport);
 
         let mut buf = [0u8; 1500];

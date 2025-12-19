@@ -1,5 +1,6 @@
 pub mod error;
 pub mod frame;
+pub mod jitter_buffer;
 pub mod packetizer;
 pub mod pipeline;
 pub mod track;
@@ -8,6 +9,7 @@ pub use error::{MediaError, MediaResult};
 pub use frame::{
     AudioFrame, AudioSampleFormat, MediaKind, MediaSample, VideoFrame, VideoPixelFormat,
 };
+pub use jitter_buffer::JitterBuffer;
 pub use packetizer::{Packetizer, Payloader, SimplePayloader, Vp8Payloader};
 pub use pipeline::{
     ChannelMediaSink, ChannelMediaSource, DynMediaSink, DynMediaSource, MediaSink, MediaSource,
