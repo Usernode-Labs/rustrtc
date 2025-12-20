@@ -18,7 +18,7 @@ const RTO_ALPHA: f64 = 0.125;
 const RTO_BETA: f64 = 0.25;
 
 // Flow Control Constants
-const CWND_INITIAL: usize = 1200 * 200; // Start with 200 MTUs for better performance
+const CWND_INITIAL: usize = 1200 * 20;
 const MAX_BURST: usize = 20; // RFC 4960 Section 7.2.4
 
 #[derive(Debug, Clone)]
