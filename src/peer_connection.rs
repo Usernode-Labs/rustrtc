@@ -402,7 +402,14 @@ impl PeerConnection {
         kind: MediaKind,
         direction: TransceiverDirection,
     ) -> Arc<RtpTransceiver> {
-        let mut builder = RtpReceiverBuilder::new(kind, random_u32());
+        let index = self
+            .inner
+            .transceivers
+            .lock()
+            .map(|list| list.len())
+            .unwrap_or(0);
+        let ssrc = 2000 + index as u32;
+        let mut builder = RtpReceiverBuilder::new(kind, ssrc);
 
         let nack_enabled = if let Some(caps) = &self.inner.config.media_capabilities {
             match kind {
