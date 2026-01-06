@@ -225,6 +225,7 @@ pub struct RtcConfiguration {
     pub nack_buffer_size: usize,
     pub media_capabilities: Option<MediaCapabilities>,
     pub external_ip: Option<String>,
+    pub bind_ip: Option<String>,
     pub disable_ipv6: bool,
     pub ssrc_start: u32,
     pub stun_timeout: std::time::Duration,
@@ -251,6 +252,7 @@ impl Default for RtcConfiguration {
             nack_buffer_size: 200,
             media_capabilities: None,
             external_ip: None,
+            bind_ip: None,
             disable_ipv6: false,
             ssrc_start: 10000,
             stun_timeout: std::time::Duration::from_secs(5),
@@ -321,6 +323,11 @@ impl RtcConfigurationBuilder {
 
     pub fn external_ip(mut self, ip: String) -> Self {
         self.inner.external_ip = Some(ip);
+        self
+    }
+
+    pub fn bind_ip(mut self, ip: String) -> Self {
+        self.inner.bind_ip = Some(ip);
         self
     }
 

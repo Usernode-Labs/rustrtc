@@ -20,11 +20,11 @@ use tokio::sync::{Mutex, broadcast, mpsc, oneshot, watch};
 use tokio::time::timeout;
 use tracing::{debug, instrument, trace, warn};
 
+#[cfg(any(test, feature = "simulator"))]
+use self::stun::random_u32;
 use self::stun::{
     StunAttribute, StunClass, StunDecoded, StunMessage, StunMethod, random_bytes, random_u64,
 };
-#[cfg(any(test, feature = "simulator"))]
-use self::stun::random_u32;
 use crate::{IceServer, IceTransportPolicy, RtcConfiguration};
 
 pub(crate) const MAX_STUN_MESSAGE: usize = 1500;
@@ -1528,7 +1528,9 @@ impl IceGatherer {
             }
             bail!("No available ports in range {}..{}", start, end)
         } else {
-            UdpSocket::bind(SocketAddr::new(ip, 0)).await.map_err(|e| anyhow!(e))
+            UdpSocket::bind(SocketAddr::new(ip, 0))
+                .await
+                .map_err(|e| anyhow!(e))
         }
     }
 
@@ -1591,24 +1593,41 @@ impl IceGatherer {
     }
 
     async fn gather_host_candidates(&self) -> Result<()> {
-        // 1. Loopback
-        let loopback_ip = IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
-        match self.bind_socket(loopback_ip).await {
-            Ok(socket) => {
-                if let Ok(addr) = socket.local_addr() {
-                    let socket = Arc::new(socket);
-                    self.sockets.lock().unwrap().push(socket.clone());
-                    let _ = self.socket_tx.send(IceSocketWrapper::Udp(socket));
-                    self.push_candidate(IceCandidate::host(addr, 1));
+        let mut bind_ips = Vec::new();
+
+        if let Some(bind_ip_str) = &self.config.bind_ip {
+            if let Ok(ip) = bind_ip_str.parse::<IpAddr>() {
+                bind_ips.push(ip);
+            }
+        } else if self.config.transport_mode != crate::TransportMode::WebRtc {
+            // Non-WebRTC mode: prefer a LAN IP if available.
+            // Binding to 0.0.0.0 on macOS can lead to "No route to host" (os error 65)
+            // if the destination is on a LAN segment but the OS picks a wrong default interface.
+            if let Ok(ip) = get_local_ip() {
+                bind_ips.push(ip);
+            } else {
+                bind_ips.push(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
+            }
+        } else {
+            // Default: bind to loopback and all LAN IPs
+            bind_ips.push(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
+
+            use network_interface::{NetworkInterface, NetworkInterfaceConfig};
+            if let Ok(interfaces) = NetworkInterface::show() {
+                for interface in interfaces {
+                    for addr in interface.addr {
+                        if let network_interface::Addr::V4(ipv4) = addr {
+                            let ip = IpAddr::V4(ipv4.ip);
+                            if !ip.is_loopback() && !bind_ips.contains(&ip) {
+                                bind_ips.push(ip);
+                            }
+                        }
+                    }
                 }
             }
-            Err(e) => warn!("Failed to bind loopback socket: {}", e),
         }
 
-        // 2. LAN IP
-        if let Ok(ip) = get_local_ip()
-            && !ip.is_loopback()
-        {
+        for ip in bind_ips {
             match self.bind_socket(ip).await {
                 Ok(socket) => {
                     if let Ok(addr) = socket.local_addr() {
@@ -1619,9 +1638,22 @@ impl IceGatherer {
                         if let Some(ext_ip) = &self.config.external_ip
                             && let Ok(parsed_ip) = ext_ip.parse::<IpAddr>()
                         {
-                            let mut ext_addr = addr;
-                            ext_addr.set_ip(parsed_ip);
-                            let mut cand = IceCandidate::host(ext_addr, 1);
+                            if !ip.is_loopback() {
+                                let mut ext_addr = addr;
+                                ext_addr.set_ip(parsed_ip);
+                                let mut cand = IceCandidate::host(ext_addr, 1);
+                                cand.related_address = Some(addr);
+                                self.push_candidate(cand);
+                            } else {
+                                self.push_candidate(IceCandidate::host(addr, 1));
+                            }
+                        } else if ip.is_unspecified() {
+                            // If bound to 0.0.0.0 and no external_ip, try to find a reachable local IP for the candidate
+                            let mut cand_addr = addr;
+                            if let Ok(local_ip) = get_local_ip() {
+                                cand_addr.set_ip(local_ip);
+                            }
+                            let mut cand = IceCandidate::host(cand_addr, 1);
                             cand.related_address = Some(addr);
                             self.push_candidate(cand);
                         } else {
@@ -1629,7 +1661,13 @@ impl IceGatherer {
                         }
                     }
                 }
-                Err(e) => warn!("Failed to bind LAN socket on {}: {}", ip, e),
+                Err(e) => {
+                    if self.config.bind_ip.is_some() {
+                        warn!("Failed to bind to requested bind_ip {}: {}", ip, e);
+                    } else if !ip.is_loopback() && !ip.is_unspecified() {
+                        warn!("Failed to bind socket on {}: {}", ip, e);
+                    }
+                }
             }
         }
 
@@ -1681,8 +1719,14 @@ impl IceGatherer {
     async fn probe_stun(&self, uri: &IceServerUri) -> Result<Option<IceCandidate>> {
         let addr = uri.resolve(self.config.disable_ipv6).await?;
         let socket = match uri.transport {
-            IceTransportProtocol::Udp => self.bind_socket(IpAddr::V4(std::net::Ipv4Addr::new(0, 0, 0, 0))).await?,
-            IceTransportProtocol::Tcp => self.bind_socket(IpAddr::V4(std::net::Ipv4Addr::new(0, 0, 0, 0))).await?,
+            IceTransportProtocol::Udp => {
+                self.bind_socket(IpAddr::V4(std::net::Ipv4Addr::new(0, 0, 0, 0)))
+                    .await?
+            }
+            IceTransportProtocol::Tcp => {
+                self.bind_socket(IpAddr::V4(std::net::Ipv4Addr::new(0, 0, 0, 0)))
+                    .await?
+            }
         };
         let local_addr = socket.local_addr()?;
         let tx_id = random_bytes::<12>();
@@ -1887,7 +1931,8 @@ impl IceSocketWrapper {
                                 continue;
                             }
                         }
-                        return Err(e.into());
+                        let reason = anyhow!("UDP {} -> {} failed: {}", s.local_addr()?, addr, e);
+                        return Err(reason);
                     }
                 },
                 IceSocketWrapper::Turn(c, _) => {
