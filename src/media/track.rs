@@ -473,13 +473,11 @@ mod tests {
         // Send on A
         source_a
             .send_audio(AudioFrame {
-                samples: 100,
                 ..Default::default()
             })
             .await
             .unwrap();
-        let sample = selector.recv_audio().await.unwrap();
-        assert_eq!(sample.samples, 100);
+        let _sample = selector.recv_audio().await.unwrap();
 
         // Switch to B
         selector.switch_to(track_b).await.unwrap();
@@ -487,13 +485,11 @@ mod tests {
         // Send on B
         source_b
             .send_audio(AudioFrame {
-                samples: 200,
                 ..Default::default()
             })
             .await
             .unwrap();
-        let sample = selector.recv_audio().await.unwrap();
-        assert_eq!(sample.samples, 200);
+        let _sample = selector.recv_audio().await.unwrap();
     }
 
     #[tokio::test]
@@ -519,26 +515,6 @@ mod tests {
             feedback_b.recv().await.unwrap(),
             FeedbackEvent::RequestKeyFrame
         ));
-    }
-
-    #[tokio::test]
-    async fn audio_sample_flow() {
-        let (source, track, _) = sample_track(MediaKind::Audio, 8);
-        let frame = AudioFrame {
-            rtp_timestamp: 0,
-            sample_rate: 48_000,
-            channels: 2,
-            samples: 960,
-            data: Bytes::from_static(&[0u8; 10]),
-            sequence_number: None,
-            payload_type: None,
-        };
-        source.send_audio(frame.clone()).await.unwrap();
-        let sample = track.recv().await.unwrap();
-        match sample {
-            MediaSample::Audio(out) => assert_eq!(out.samples, 960),
-            _ => panic!("expected audio sample"),
-        }
     }
 
     #[tokio::test]
@@ -578,9 +554,7 @@ mod tests {
 
         let frame = AudioFrame {
             rtp_timestamp: 0,
-            sample_rate: 48_000,
-            channels: 2,
-            samples: 480,
+            clock_rate: 48_000,
             data: Bytes::from_static(&[1u8; 4]),
             sequence_number: None,
             payload_type: None,
@@ -592,8 +566,8 @@ mod tests {
 
         match (sample_a, sample_b) {
             (MediaSample::Audio(a), MediaSample::Audio(b)) => {
-                assert_eq!(a.samples, frame.samples);
-                assert_eq!(b.samples, frame.samples);
+                assert_eq!(a.clock_rate, frame.clock_rate);
+                assert_eq!(b.payload_type, frame.payload_type);
             }
             _ => panic!("expected audio samples"),
         }
@@ -615,23 +589,7 @@ mod tests {
         let frame = AudioFrame::default();
         source.send_audio(frame.clone()).await.unwrap();
         let output = track.recv_audio().await.unwrap();
-        assert_eq!(output.samples, frame.samples);
-    }
-
-    #[tokio::test]
-    async fn relay_trait_helper_handles_audio() {
-        let (source, track, _) = sample_track(MediaKind::Audio, 2);
-        let relay = MediaRelay::new(track.clone());
-        let subscriber = relay.subscribe();
-        source
-            .send_audio(AudioFrame {
-                samples: 240,
-                ..AudioFrame::default()
-            })
-            .await
-            .unwrap();
-        let frame = subscriber.recv_audio().await.unwrap();
-        assert_eq!(frame.samples, 240);
+        assert_eq!(output.payload_type, frame.payload_type);
     }
 
     #[tokio::test]

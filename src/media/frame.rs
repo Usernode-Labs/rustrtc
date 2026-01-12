@@ -22,9 +22,7 @@ pub enum VideoPixelFormat {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AudioFrame {
     pub rtp_timestamp: u32,
-    pub sample_rate: u32,
-    pub channels: u8,
-    pub samples: u32,
+    pub clock_rate: u32,
     pub data: Bytes,
     pub sequence_number: Option<u16>,
     pub payload_type: Option<u8>,
@@ -34,9 +32,7 @@ impl Default for AudioFrame {
     fn default() -> Self {
         Self {
             rtp_timestamp: 0,
-            sample_rate: 48_000,
-            channels: 2,
-            samples: 0,
+            clock_rate: 0,
             data: Bytes::new(),
             sequence_number: None,
             payload_type: None,
@@ -132,31 +128,17 @@ impl MediaSample {
         RtpPacket::new(header, payload.to_vec())
     }
 
-    pub fn from_rtp_packet(
-        packet: RtpPacket,
-        kind: MediaKind,
-        clock_rate: u32,
-        channels: u8,
-    ) -> Self {
+    pub fn from_rtp_packet(packet: RtpPacket, kind: MediaKind, clock_rate: u32) -> Self {
         let data = bytes::Bytes::from(packet.payload);
 
         match kind {
-            MediaKind::Audio => {
-                let samples = if channels > 0 {
-                    (data.len() as u32) / (channels as u32 * 2)
-                } else {
-                    0
-                };
-                MediaSample::Audio(AudioFrame {
-                    rtp_timestamp: packet.header.timestamp,
-                    sample_rate: clock_rate,
-                    channels,
-                    samples,
-                    data,
-                    sequence_number: Some(packet.header.sequence_number),
-                    payload_type: Some(packet.header.payload_type),
-                })
-            }
+            MediaKind::Audio => MediaSample::Audio(AudioFrame {
+                rtp_timestamp: packet.header.timestamp,
+                clock_rate,
+                data,
+                sequence_number: Some(packet.header.sequence_number),
+                payload_type: Some(packet.header.payload_type),
+            }),
             MediaKind::Video => MediaSample::Video(VideoFrame {
                 rtp_timestamp: packet.header.timestamp,
                 width: 0,

@@ -53,8 +53,8 @@ impl JitterBuffer {
             // For video at 90kHz with 33ms packets: ~3000 samples
             // We allow up to 10 seconds of jump to handle legitimate gaps
             let max_reasonable_jump: u32 = match &sample {
-                MediaSample::Audio(f) => f.sample_rate * 10,  // 10 seconds
-                MediaSample::Video(_) => 90000 * 10,           // 10 seconds at 90kHz
+                MediaSample::Audio(f) => f.clock_rate * 10, // 10 seconds
+                MediaSample::Video(_) => 90000 * 10,        // 10 seconds at 90kHz
             };
 
             let ts_diff = timestamp.wrapping_sub(last_ts);
@@ -65,7 +65,11 @@ impl JitterBuffer {
                 // Massive forward jump - likely from a different stream
                 tracing::debug!(
                     "JitterBuffer: Rejecting packet with large timestamp jump: seq={} ts={} last_ts={} diff={} (>{}s)",
-                    seq, timestamp, last_ts, ts_diff, ts_diff / 8000
+                    seq,
+                    timestamp,
+                    last_ts,
+                    ts_diff,
+                    ts_diff / 8000
                 );
                 return;
             } else if ts_diff > (u32::MAX / 2) {
@@ -74,7 +78,11 @@ impl JitterBuffer {
                 if backward_diff > max_reasonable_jump {
                     tracing::debug!(
                         "JitterBuffer: Rejecting packet with large backward timestamp jump: seq={} ts={} last_ts={} backward_diff=-{} (>{}s)",
-                        seq, timestamp, last_ts, backward_diff, backward_diff / 8000
+                        seq,
+                        timestamp,
+                        last_ts,
+                        backward_diff,
+                        backward_diff / 8000
                     );
                     return;
                 }
@@ -228,7 +236,7 @@ mod tests {
     #[test]
     fn test_jitter_buffer_ordering() {
         let mut jb = JitterBuffer::new(Duration::from_millis(0), Duration::from_millis(100), 10);
-        
+
         // Push out of order
         jb.push(make_sample(2));
         jb.push(make_sample(1));
@@ -245,23 +253,23 @@ mod tests {
     fn test_jitter_buffer_min_delay() {
         let mut jb = JitterBuffer::new(Duration::from_millis(50), Duration::from_millis(100), 10);
         jb.push(make_sample(1));
-        
+
         // Immediate pop should be None due to min_delay
         assert!(jb.pop().is_none());
-        
-        // We can't easily mock time in standard tests without extra crates, 
+
+        // We can't easily mock time in standard tests without extra crates,
         // but we can verify it doesn't pop immediately.
     }
 
     #[test]
     fn test_jitter_buffer_gap_waiting() {
         let mut jb = JitterBuffer::new(Duration::from_millis(0), Duration::from_millis(50), 10);
-        
+
         jb.push(make_sample(1));
         assert_eq!(get_seq(jb.pop().unwrap()), 1);
-        
+
         jb.push(make_sample(3)); // Gap: 2 is missing
-        
+
         // Should not pop 3 immediately because we are waiting for 2
         assert!(jb.pop().is_none());
     }
@@ -269,7 +277,7 @@ mod tests {
     #[test]
     fn test_jitter_buffer_wrap_around() {
         let mut jb = JitterBuffer::new(Duration::from_millis(0), Duration::from_millis(100), 10);
-        
+
         jb.push(make_sample(65535));
         jb.push(make_sample(0));
         jb.push(make_sample(1));
@@ -282,7 +290,7 @@ mod tests {
     #[test]
     fn test_jitter_buffer_duplicate() {
         let mut jb = JitterBuffer::new(Duration::from_millis(0), Duration::from_millis(100), 10);
-        
+
         jb.push(make_sample(1));
         jb.push(make_sample(1)); // Duplicate
 
@@ -293,10 +301,10 @@ mod tests {
     #[test]
     fn test_jitter_buffer_outdated() {
         let mut jb = JitterBuffer::new(Duration::from_millis(0), Duration::from_millis(100), 10);
-        
+
         jb.push(make_sample(10));
         assert_eq!(get_seq(jb.pop().unwrap()), 10);
-        
+
         jb.push(make_sample(5)); // Outdated
         assert!(jb.pop().is_none());
     }
@@ -304,7 +312,7 @@ mod tests {
     #[test]
     fn test_jitter_buffer_capacity() {
         let mut jb = JitterBuffer::new(Duration::from_millis(0), Duration::from_millis(100), 2);
-        
+
         jb.push(make_sample(1));
         jb.push(make_sample(2));
         jb.push(make_sample(3)); // Should drop 1
@@ -318,7 +326,7 @@ mod tests {
     fn test_jitter_buffer_next_pop_wait() {
         let min_delay = Duration::from_millis(50);
         let mut jb = JitterBuffer::new(min_delay, Duration::from_millis(100), 10);
-        
+
         jb.push(make_sample(1));
         let wait = jb.next_pop_wait().unwrap();
         assert!(wait > Duration::from_millis(0));

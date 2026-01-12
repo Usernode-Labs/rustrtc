@@ -3350,7 +3350,6 @@ impl RtpReceiver {
                                                 packet,
                                                 source.kind(),
                                                 params.clock_rate,
-                                                params.channels,
                                             );
                                             if let Ok(_) = source.send(sample).await {
                                                 let rid_clone = rid.clone();

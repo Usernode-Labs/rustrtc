@@ -220,7 +220,6 @@ mod tests {
         let mut track_source = TrackMediaSource::new(track.clone());
         source
             .send_audio(AudioFrame {
-                samples: 960,
                 data: Bytes::from_static(&[1; 4]),
                 ..AudioFrame::default()
             })
@@ -243,7 +242,6 @@ mod tests {
     async fn channel_media_source_provides_samples() {
         let (sender, mut source) = ChannelMediaSource::channel(MediaKind::Audio, 1);
         let sample = MediaSample::Audio(AudioFrame {
-            samples: 123,
             ..AudioFrame::default()
         });
         sender.send(sample.clone()).await.unwrap();
@@ -272,7 +270,6 @@ mod tests {
 
         source_handle
             .send_audio(AudioFrame {
-                samples: 320,
                 ..AudioFrame::default()
             })
             .await
@@ -323,7 +320,6 @@ mod tests {
 
         sender
             .send(MediaSample::Audio(AudioFrame {
-                samples: 42,
                 ..AudioFrame::default()
             }))
             .await
@@ -344,7 +340,6 @@ mod tests {
 
         producer
             .send_audio(AudioFrame {
-                samples: 160,
                 ..AudioFrame::default()
             })
             .await
