@@ -14,13 +14,13 @@ async fn test_sctp_reliability_under_loss() -> Result<()> {
     let dc1 = pc1.create_data_channel("reliable", None)?;
 
     // Exchange SDP
-    let offer = pc1.create_offer()?;
+    let offer = pc1.create_offer().await?;
     pc1.set_local_description(offer.clone())?;
     pc1.wait_for_gathering_complete().await;
     let offer = pc1.local_description().unwrap();
 
     pc2.set_remote_description(offer).await?;
-    let answer = pc2.create_answer()?;
+    let answer = pc2.create_answer().await?;
     pc2.set_local_description(answer.clone())?;
     pc2.wait_for_gathering_complete().await;
     let answer = pc2.local_description().unwrap();

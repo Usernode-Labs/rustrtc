@@ -17,7 +17,7 @@ async fn test_srtp_local_sdp_port() -> Result<()> {
     // but usually we need to create offer to establish what we are gathering for)
     // In rustrtc, create_offer triggers gathering if not started?
     // Let's check create_offer implementation or just call it.
-    let offer = pc.create_offer()?;
+    let offer = pc.create_offer().await?;
     pc.set_local_description(offer)?;
 
     pc.wait_for_gathering_complete().await;
@@ -34,11 +34,11 @@ async fn test_srtp_local_sdp_port() -> Result<()> {
     for media in &local_desc.media_sections {
         println!("Media: {}, Port: {}", media.mid, media.port);
         assert!(media.port > 0, "Port should be non-zero for SRTP");
-        assert!(
-            media.connection.is_some(),
-            "Connection line (c=) should be present"
-        );
-        let conn = media.connection.as_ref().unwrap();
+        let conn = media
+            .connection
+            .as_ref()
+            .or(local_desc.session.connection.as_ref())
+            .expect("Connection line (c=) should be present in session or media section");
         assert!(
             conn.contains("IP4") || conn.contains("IP6"),
             "Connection should contain IP address"
@@ -60,7 +60,7 @@ async fn test_rtp_local_sdp_port() -> Result<()> {
     // Add a transceiver so we have a media section
     pc.add_transceiver(MediaKind::Video, TransceiverDirection::SendRecv);
 
-    let offer = pc.create_offer()?;
+    let offer = pc.create_offer().await?;
     pc.set_local_description(offer)?;
 
     pc.wait_for_gathering_complete().await;
@@ -78,8 +78,8 @@ async fn test_rtp_local_sdp_port() -> Result<()> {
         println!("Media: {}, Port: {}", media.mid, media.port);
         assert!(media.port > 0, "Port should be non-zero for RTP");
         assert!(
-            media.connection.is_some(),
-            "Connection line (c=) should be present"
+            media.connection.is_some() || local_desc.session.connection.is_some(),
+            "Connection line (c=) should be present in session or media section"
         );
     }
 
@@ -98,7 +98,7 @@ async fn test_ssrc_negotiation_without_track() -> Result<()> {
     // Add a transceiver without adding a track
     pc.add_transceiver(MediaKind::Audio, TransceiverDirection::SendOnly);
 
-    let offer = pc.create_offer()?;
+    let offer = pc.create_offer().await?;
 
     // Check if the offer contains a=ssrc
     let sdp = offer.to_sdp_string();

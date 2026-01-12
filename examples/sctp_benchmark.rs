@@ -51,7 +51,7 @@ async fn main() -> anyhow::Result<()> {
 
     // 4. Exchange SDP
     // PC1 creates offer
-    let _ = pc1.create_offer()?;
+    let _ = pc1.create_offer().await?;
     // Wait for gathering to complete
     loop {
         if pc1.ice_transport().gather_state()
@@ -61,7 +61,7 @@ async fn main() -> anyhow::Result<()> {
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    let offer = pc1.create_offer()?; // Re-create with candidates
+    let offer = pc1.create_offer().await?; // Re-create with candidates
     pc1.set_local_description(offer.clone())?;
 
     // PC2 receives offer
@@ -69,7 +69,7 @@ async fn main() -> anyhow::Result<()> {
     pc2.set_remote_description(offer_sdp).await?;
 
     // PC2 creates answer
-    let _ = pc2.create_answer()?;
+    let _ = pc2.create_answer().await?;
     // Wait for gathering
     loop {
         if pc2.ice_transport().gather_state()
@@ -79,7 +79,7 @@ async fn main() -> anyhow::Result<()> {
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    let answer = pc2.create_answer()?; // Re-create with candidates
+    let answer = pc2.create_answer().await?; // Re-create with candidates
     pc2.set_local_description(answer.clone())?;
 
     // PC1 receives answer

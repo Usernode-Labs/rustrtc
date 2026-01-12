@@ -192,12 +192,12 @@ async fn handle_rustrtc_offer(payload: OfferRequest) -> Json<OfferResponse> {
         }
     }
     // Create answer and wait for gathering
-    let _ = pc.create_answer().unwrap();
+    let _ = pc.create_answer().await.unwrap();
 
     // Wait for gathering to complete
     pc.wait_for_gathering_complete().await;
 
-    let answer = pc.create_answer().unwrap();
+    let answer = pc.create_answer().await.unwrap();
     pc.set_local_description(answer.clone()).unwrap();
 
     Json(OfferResponse {

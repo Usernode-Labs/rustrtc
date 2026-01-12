@@ -493,14 +493,14 @@ async fn run_rustrtc(count: usize) -> (f64, u64, u64) {
             let dc1 = pc1.create_data_channel("bench", None).unwrap();
 
             // Exchange SDP
-            let offer = pc1.create_offer().unwrap();
+            let offer = pc1.create_offer().await.unwrap();
             pc1.set_local_description(offer.clone()).unwrap();
             pc1.wait_for_gathering_complete().await;
             let offer = pc1.local_description().unwrap();
 
             pc2.set_remote_description(offer).await.unwrap();
 
-            let answer = pc2.create_answer().unwrap();
+            let answer = pc2.create_answer().await.unwrap();
             pc2.set_local_description(answer.clone()).unwrap();
             pc2.wait_for_gathering_complete().await;
             let answer = pc2.local_description().unwrap();

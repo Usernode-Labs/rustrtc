@@ -42,11 +42,11 @@ async fn test_padding_packet_drop() -> Result<()> {
     // 3. Negotiate
     // PC1 Create Offer
     println!("PC1 Create Offer");
-    let _ = pc1.create_offer()?; // Trigger gathering
+    let _ = pc1.create_offer().await?; // Trigger gathering
     println!("PC1 Wait Gathering");
     pc1.wait_for_gathering_complete().await;
     println!("PC1 Create Offer 2");
-    let offer = pc1.create_offer()?;
+    let offer = pc1.create_offer().await?;
     pc1.set_local_description(offer.clone())?;
 
     // PC2 Set Remote Offer
@@ -72,11 +72,11 @@ async fn test_padding_packet_drop() -> Result<()> {
 
     // PC2 Create Answer
     println!("PC2 Create Answer");
-    let _ = pc2.create_answer()?; // Trigger gathering
+    let _ = pc2.create_answer().await?; // Trigger gathering
     println!("PC2 Wait Gathering");
     pc2.wait_for_gathering_complete().await;
     println!("PC2 Create Answer 2");
-    let answer = pc2.create_answer()?;
+    let answer = pc2.create_answer().await?;
     pc2.set_local_description(answer.clone())?;
 
     // PC1 Set Remote Answer

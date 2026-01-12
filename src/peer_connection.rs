@@ -534,7 +534,7 @@ impl PeerConnection {
         self.inner.transceivers.lock().unwrap().clone()
     }
 
-    pub fn create_offer(&self) -> RtcResult<SessionDescription> {
+    pub async fn create_offer(&self) -> RtcResult<SessionDescription> {
         let state = &self.inner.signaling_state;
         if *state.borrow() != SignalingState::Stable {
             return Err(RtcError::InvalidState(format!(
@@ -553,10 +553,12 @@ impl PeerConnection {
                 .ice_transport
                 .set_role(crate::transports::ice::IceRole::Controlling);
         }
-        self.inner.build_description(SdpType::Offer, |dir| dir)
+        self.inner
+            .build_description(SdpType::Offer, |dir| dir)
+            .await
     }
 
-    pub fn create_answer(&self) -> RtcResult<SessionDescription> {
+    pub async fn create_answer(&self) -> RtcResult<SessionDescription> {
         let state = &self.inner.signaling_state;
         if *state.borrow() != SignalingState::HaveRemoteOffer {
             return Err(RtcError::InvalidState(
@@ -568,6 +570,7 @@ impl PeerConnection {
             .set_role(crate::transports::ice::IceRole::Controlled);
         self.inner
             .build_description(SdpType::Answer, |dir| dir.answer_direction())
+            .await
     }
 
     pub fn set_local_description(&self, desc: SessionDescription) -> RtcResult<()> {
@@ -1975,7 +1978,7 @@ fn is_ice_disconnected(state: crate::transports::ice::IceTransportState) -> bool
 }
 
 impl PeerConnectionInner {
-    fn build_description<F>(
+    async fn build_description<F>(
         &self,
         sdp_type: SdpType,
         map_direction: F,
@@ -2039,6 +2042,25 @@ impl PeerConnectionInner {
         self.ice_transport
             .start_gathering()
             .map_err(|err| RtcError::InvalidState(format!("ICE gathering failed: {err}")))?;
+
+        let mode = self.config.transport_mode.clone();
+
+        // For non-WebRTC, wait for at least one candidate if none are available.
+        // This ensures the SDP doesn't default to port 9 when no candidates are gathered yet.
+        if mode != TransportMode::WebRtc {
+            let mut candidates = self.ice_transport.local_candidates();
+            if candidates.is_empty() {
+                let mut rx = self.ice_transport.subscribe_candidates();
+                let start = tokio::time::Instant::now();
+                let timeout_dur = tokio::time::Duration::from_millis(500);
+
+                while candidates.is_empty() && start.elapsed() < timeout_dur {
+                    let _ = tokio::time::timeout(timeout_dur - start.elapsed(), rx.recv()).await;
+                    candidates = self.ice_transport.local_candidates();
+                }
+            }
+        }
+
         let ice_params = self.ice_transport.local_parameters();
         let ice_username = ice_params.username_fragment.clone();
         let ice_password = ice_params.password.clone();
@@ -3485,13 +3507,13 @@ mod tests {
         transceiver.set_sender(Some(sender));
 
         // First create_offer triggers gathering
-        let _ = pc.create_offer().unwrap();
+        let _ = pc.create_offer().await.unwrap();
 
         // Wait for gathering to complete to ensure we have candidates and end-of-candidates
         pc.wait_for_gathering_complete().await;
 
         // Create offer again to get the candidates
-        let offer = pc.create_offer().unwrap();
+        let offer = pc.create_offer().await.unwrap();
 
         assert_eq!(offer.media_sections.len(), 1);
         let section = &offer.media_sections[0];
@@ -3543,7 +3565,7 @@ mod tests {
     async fn offer_includes_video_capabilities() {
         let pc = PeerConnection::new(RtcConfiguration::default());
         pc.add_transceiver(MediaKind::Video, TransceiverDirection::SendRecv);
-        let offer = pc.create_offer().unwrap();
+        let offer = pc.create_offer().await.unwrap();
         let section = &offer.media_sections[0];
         assert_eq!(section.kind, MediaKind::Video);
         assert_eq!(section.formats, vec![VIDEO_PAYLOAD_TYPE.to_string()]);
@@ -3563,7 +3585,7 @@ mod tests {
     async fn offer_includes_application_capabilities() {
         let pc = PeerConnection::new(RtcConfiguration::default());
         pc.add_transceiver(MediaKind::Application, TransceiverDirection::SendRecv);
-        let offer = pc.create_offer().unwrap();
+        let offer = pc.create_offer().await.unwrap();
         let section = &offer.media_sections[0];
         assert_eq!(section.kind, MediaKind::Application);
         assert_eq!(section.protocol, "UDP/DTLS/SCTP");
@@ -3694,7 +3716,7 @@ mod tests {
     async fn set_local_description_transitions_state() {
         let pc = PeerConnection::new(RtcConfiguration::default());
         pc.add_transceiver(MediaKind::Audio, TransceiverDirection::SendRecv);
-        let offer = pc.create_offer().unwrap();
+        let offer = pc.create_offer().await.unwrap();
         pc.set_local_description(offer.clone()).unwrap();
         assert_eq!(pc.signaling_state(), SignalingState::HaveLocalOffer);
 
@@ -3708,12 +3730,12 @@ mod tests {
     async fn create_answer_requires_remote_offer() {
         let pc = PeerConnection::new(RtcConfiguration::default());
         pc.add_transceiver(MediaKind::Video, TransceiverDirection::SendOnly);
-        let err = pc.create_answer().unwrap_err();
+        let err = pc.create_answer().await.unwrap_err();
         assert!(matches!(err, RtcError::InvalidState(_)));
 
-        let offer = pc.create_offer().unwrap();
+        let offer = pc.create_offer().await.unwrap();
         pc.set_remote_description(offer.clone()).await.unwrap();
-        let answer = pc.create_answer().unwrap();
+        let answer = pc.create_answer().await.unwrap();
         assert_eq!(answer.media_sections.len(), 1);
         assert_eq!(answer.media_sections[0].direction, Direction::RecvOnly);
         pc.set_local_description(answer).unwrap();
@@ -3724,7 +3746,7 @@ mod tests {
     async fn remote_answer_without_local_offer_is_error() {
         let pc = PeerConnection::new(RtcConfiguration::default());
         pc.add_transceiver(MediaKind::Audio, TransceiverDirection::RecvOnly);
-        let mut fake_answer = pc.create_offer().unwrap();
+        let mut fake_answer = pc.create_offer().await.unwrap();
         fake_answer.sdp_type = SdpType::Answer;
         let err = pc.set_remote_description(fake_answer).await.unwrap_err();
         assert!(matches!(err, RtcError::InvalidState(_)));
@@ -3759,7 +3781,7 @@ mod tests {
             .build();
         transceiver.set_sender(Some(sender));
 
-        let offer = pc.create_offer().unwrap();
+        let offer = pc.create_offer().await.unwrap();
         let section = &offer.media_sections[0];
 
         // Should NOT have ICE attributes
@@ -3796,7 +3818,7 @@ mod tests {
         let pc = PeerConnection::new(config);
         pc.add_transceiver(MediaKind::Audio, TransceiverDirection::SendRecv);
 
-        let offer = pc.create_offer().unwrap();
+        let offer = pc.create_offer().await.unwrap();
         let section = &offer.media_sections[0];
 
         // Should NOT have ICE attributes
@@ -3929,7 +3951,7 @@ a=ssrc-group:FID 12345 67890\r\n";
         let pc = PeerConnection::new(config);
         pc.add_transceiver(MediaKind::Audio, TransceiverDirection::SendRecv);
 
-        let offer = pc.create_offer().unwrap();
+        let offer = pc.create_offer().await.unwrap();
         let section = &offer.media_sections[0];
 
         // Should have crypto attribute

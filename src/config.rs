@@ -107,7 +107,7 @@ impl Default for AudioCapability {
             clock_rate: 48000,
             channels: 2,
             fmtp: Some("minptime=10;useinbandfec=1".to_string()),
-            rtcp_fbs: vec!["nack".to_string()],
+            rtcp_fbs: vec![],
         }
     }
 }
@@ -124,7 +124,7 @@ impl AudioCapability {
             clock_rate: 8000,
             channels: 1,
             fmtp: None,
-            rtcp_fbs: vec!["nack".to_string()],
+            rtcp_fbs: vec![],
         }
     }
 
@@ -135,7 +135,7 @@ impl AudioCapability {
             clock_rate: 8000,
             channels: 1,
             fmtp: None,
-            rtcp_fbs: vec!["nack".to_string()],
+            rtcp_fbs: vec![],
         }
     }
 
@@ -146,7 +146,18 @@ impl AudioCapability {
             clock_rate: 8000,
             channels: 1,
             fmtp: None,
-            rtcp_fbs: vec!["nack".to_string()],
+            rtcp_fbs: vec![],
+        }
+    }
+
+    pub fn g729() -> Self {
+        Self {
+            payload_type: 18,
+            codec_name: "G729".to_string(),
+            clock_rate: 8000,
+            channels: 1,
+            fmtp: None,
+            rtcp_fbs: vec![],
         }
     }
 

@@ -9,6 +9,6 @@ async fn main() {
     pc.add_transceiver(MediaKind::Audio, TransceiverDirection::SendRecv);
     pc.create_data_channel("test", None).unwrap();
 
-    let offer = pc.create_offer().unwrap();
+    let offer = pc.create_offer().await.unwrap();
     println!("SDP:\n{}", offer.to_sdp_string());
 }

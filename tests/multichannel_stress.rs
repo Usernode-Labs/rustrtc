@@ -143,9 +143,9 @@ async fn multichannel_stress_test() -> Result<()> {
     rust_pc.set_remote_description(rust_offer).await?;
 
     // RustRTC creates Answer
-    let _ = rust_pc.create_answer()?;
+    let _ = rust_pc.create_answer().await?;
     rust_pc.wait_for_gathering_complete().await;
-    let answer = rust_pc.create_answer()?;
+    let answer = rust_pc.create_answer().await?;
     rust_pc.set_local_description(answer.clone())?;
 
     let _ = answer_tx.send(answer.to_sdp_string());

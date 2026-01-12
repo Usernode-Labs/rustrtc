@@ -39,12 +39,12 @@ async fn interop_ice_dtls_handshake() -> Result<()> {
 
     // 3. RustRTC creates Offer
     // Trigger gathering
-    let _ = rust_pc.create_offer()?;
+    let _ = rust_pc.create_offer().await?;
 
     // Wait for gathering to complete
     rust_pc.wait_for_gathering_complete().await;
 
-    let offer = rust_pc.create_offer()?;
+    let offer = rust_pc.create_offer().await?;
     println!("RustRTC Offer SDP:\n{}", offer.to_sdp_string());
     rust_pc.set_local_description(offer.clone())?;
 
@@ -186,12 +186,12 @@ async fn interop_vp8_echo() -> Result<()> {
 
     // 3. RustRTC creates Offer
     // Trigger gathering
-    let _ = rust_pc.create_offer()?;
+    let _ = rust_pc.create_offer().await?;
 
     // Wait for gathering to complete
     rust_pc.wait_for_gathering_complete().await;
 
-    let offer = rust_pc.create_offer()?;
+    let offer = rust_pc.create_offer().await?;
     rust_pc.set_local_description(offer.clone())?;
 
     // Convert RustRTC SDP to WebRTC SDP
@@ -385,12 +385,12 @@ async fn interop_vp8_echo_with_pli() -> Result<()> {
 
     // 3. RustRTC creates Offer
     // Trigger gathering
-    let _ = rust_pc.create_offer()?;
+    let _ = rust_pc.create_offer().await?;
 
     // Wait for gathering to complete
     rust_pc.wait_for_gathering_complete().await;
 
-    let offer = rust_pc.create_offer()?;
+    let offer = rust_pc.create_offer().await?;
     rust_pc.set_local_description(offer.clone())?;
 
     // Convert RustRTC SDP to WebRTC SDP
@@ -496,12 +496,12 @@ async fn interop_ice_close_triggers_pc_close() -> Result<()> {
     let webrtc_pc = api.new_peer_connection(webrtc_config).await?;
 
     // 3. RustRTC creates Offer
-    let _ = rust_pc.create_offer()?;
+    let _ = rust_pc.create_offer().await?;
 
     // Wait for gathering to complete
     rust_pc.wait_for_gathering_complete().await;
 
-    let offer = rust_pc.create_offer()?;
+    let offer = rust_pc.create_offer().await?;
     rust_pc.set_local_description(offer.clone())?;
 
     let offer_sdp = offer.to_sdp_string();

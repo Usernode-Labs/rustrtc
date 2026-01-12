@@ -70,7 +70,7 @@ async fn run_single_iteration() -> Option<u128> {
     let _ = pc1.create_data_channel("bench", None);
 
     // Exchange SDP
-    let offer = match pc1.create_offer() {
+    let offer = match pc1.create_offer().await {
         Ok(o) => o,
         Err(_) => return None,
     };
@@ -87,7 +87,7 @@ async fn run_single_iteration() -> Option<u128> {
         return None;
     }
 
-    let answer = match pc2.create_answer() {
+    let answer = match pc2.create_answer().await {
         Ok(a) => a,
         Err(_) => return None,
     };

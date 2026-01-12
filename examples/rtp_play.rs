@@ -41,7 +41,7 @@ async fn main() {
     };
     pc.add_track(track, params).expect("failed to add track");
 
-    let offer = pc.create_offer().expect("failed to create offer");
+    let offer = pc.create_offer().await.expect("failed to create offer");
     pc.set_local_description(offer)
         .expect("failed to set local description");
 

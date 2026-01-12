@@ -149,9 +149,9 @@ async fn offer(Json(payload): Json<OfferRequest>) -> impl IntoResponse {
         }
     }
 
-    let _ = pc.create_answer().unwrap();
+    let _ = pc.create_answer().await.unwrap();
     pc.wait_for_gathering_complete().await;
-    let answer = pc.create_answer().unwrap();
+    let answer = pc.create_answer().await.unwrap();
 
     info!("Generated Answer SDP:\n{}", answer.to_sdp_string());
 

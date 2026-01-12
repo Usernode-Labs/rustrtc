@@ -63,7 +63,7 @@ async fn interop_datachannel_test() -> Result<()> {
 
     // 3. Exchange SDP
     // Trigger gathering on Rust side (create_offer does it)
-    let _ = rust_pc.create_offer()?;
+    let _ = rust_pc.create_offer().await?;
 
     // Wait for gathering to complete (simple way)
     loop {
@@ -74,7 +74,7 @@ async fn interop_datachannel_test() -> Result<()> {
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    let offer = rust_pc.create_offer()?; // Re-create with candidates
+    let offer = rust_pc.create_offer().await?; // Re-create with candidates
     rust_pc.set_local_description(offer.clone())?;
 
     let webrtc_desc = RTCSessionDescription::offer(offer.to_sdp_string())?;
@@ -212,7 +212,7 @@ async fn interop_datachannel_dcep_test() -> Result<()> {
     ));
 
     // 3. Exchange SDP
-    let _ = rust_pc.create_offer()?;
+    let _ = rust_pc.create_offer().await?;
     loop {
         if rust_pc.ice_transport().gather_state()
             == rustrtc::transports::ice::IceGathererState::Complete
@@ -221,7 +221,7 @@ async fn interop_datachannel_dcep_test() -> Result<()> {
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    let offer = rust_pc.create_offer()?;
+    let offer = rust_pc.create_offer().await?;
     rust_pc.set_local_description(offer.clone())?;
 
     let webrtc_desc = RTCSessionDescription::offer(offer.to_sdp_string())?;
@@ -322,7 +322,7 @@ async fn interop_datachannel_incoming_test() -> Result<()> {
     let rust_offer = rustrtc::SessionDescription::parse(rustrtc::SdpType::Offer, &offer.sdp)?;
     rust_pc.set_remote_description(rust_offer).await?;
 
-    let _answer = rust_pc.create_answer()?;
+    let _answer = rust_pc.create_answer().await?;
     // Wait for gathering
     loop {
         if rust_pc.ice_transport().gather_state()
@@ -332,7 +332,7 @@ async fn interop_datachannel_incoming_test() -> Result<()> {
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    let answer = rust_pc.create_answer()?; // Re-create with candidates
+    let answer = rust_pc.create_answer().await?; // Re-create with candidates
     rust_pc.set_local_description(answer.clone())?;
 
     let webrtc_answer = RTCSessionDescription::answer(answer.to_sdp_string())?;

@@ -105,9 +105,9 @@ async fn handle_offer(Json(payload): Json<OfferRequest>) -> impl IntoResponse {
     let offer_sdp = SessionDescription::parse(SdpType::Offer, &payload.sdp).unwrap();
     pc.set_remote_description(offer_sdp).await.unwrap();
 
-    let _ = pc.create_answer().unwrap();
+    let _ = pc.create_answer().await.unwrap();
     pc.wait_for_gathering_complete().await;
-    let answer = pc.create_answer().unwrap();
+    let answer = pc.create_answer().await.unwrap();
     pc.set_local_description(answer.clone()).unwrap();
 
     Json(OfferRequest {
@@ -197,9 +197,9 @@ async fn run_client(addr_str: &str) {
         }
     });
 
-    let _ = pc.create_offer().unwrap();
+    let _ = pc.create_offer().await.unwrap();
     pc.wait_for_gathering_complete().await;
-    let offer = pc.create_offer().unwrap();
+    let offer = pc.create_offer().await.unwrap();
     pc.set_local_description(offer.clone()).unwrap();
 
     let client = reqwest::Client::new();

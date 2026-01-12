@@ -215,7 +215,7 @@ async fn session(
         let _ = tokio::time::timeout(std::time::Duration::from_secs(3), rx.recv()).await;
     }
 
-    let answer = match pc.create_answer() {
+    let answer = match pc.create_answer().await {
         Ok(a) => a,
         Err(e) => {
             warn!("Failed to create answer: {}", e);
@@ -782,7 +782,7 @@ async fn handle_chat_datachannel(
                                                 continue;
                                             }
 
-                                            let answer = match peer_clone.pc.create_answer() {
+                                            let answer = match peer_clone.pc.create_answer().await {
                                                 Ok(a) => a,
                                                 Err(e) => {
                                                     warn!("Failed to create answer from DC: {}", e);
@@ -914,7 +914,7 @@ async fn negotiate(peer: &Peer) {
 
     peer.negotiation_pending.store(false, Ordering::SeqCst);
 
-    match peer.pc.create_offer() {
+    match peer.pc.create_offer().await {
         Ok(offer) => {
             info!(
                 "Created offer for {}, sending via DC. SDP:\n{}",

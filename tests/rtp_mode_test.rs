@@ -39,11 +39,11 @@ async fn test_rtp_mode_peer_connection() -> Result<()> {
     // Exchange SDP
     // 1. PC1 Create Offer
     // Trigger gathering
-    let _ = pc1.create_offer()?;
+    let _ = pc1.create_offer().await?;
     // Wait for gathering
     pc1.wait_for_gathering_complete().await;
 
-    let offer = pc1.create_offer()?;
+    let offer = pc1.create_offer().await?;
     println!("Offer SDP:\n{}", offer.to_sdp_string());
 
     pc1.set_local_description(offer.clone())?;
@@ -51,11 +51,11 @@ async fn test_rtp_mode_peer_connection() -> Result<()> {
 
     // 2. PC2 Create Answer
     // Trigger gathering
-    let _ = pc2.create_answer()?;
+    let _ = pc2.create_answer().await?;
     // Wait for gathering
     pc2.wait_for_gathering_complete().await;
 
-    let answer = pc2.create_answer()?;
+    let answer = pc2.create_answer().await?;
     println!("Answer SDP:\n{}", answer.to_sdp_string());
 
     pc2.set_local_description(answer.clone())?;

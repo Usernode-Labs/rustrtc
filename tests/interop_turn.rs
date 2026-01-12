@@ -104,7 +104,7 @@ async fn interop_turn_datachannel_test() -> Result<()> {
         .await?;
 
     // 4. Exchange SDP
-    let _ = rust_pc.create_offer()?;
+    let _ = rust_pc.create_offer().await?;
 
     // Wait for gathering to complete
     loop {
@@ -113,7 +113,7 @@ async fn interop_turn_datachannel_test() -> Result<()> {
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    let offer = rust_pc.create_offer()?;
+    let offer = rust_pc.create_offer().await?;
 
     // Verify we have relay candidates
     let candidates = rust_pc.ice_transport().local_candidates();
