@@ -47,6 +47,7 @@ const CHUNK_HEADER_SIZE: usize = 4;
 const MAX_SCTP_PACKET_SIZE: usize = 1200;
 const DEFAULT_MAX_PAYLOAD_SIZE: usize = 1172; // 1200 - 12 (common) - 16 (data header)
 const DUP_THRESH: u8 = 3;
+// const DUP_THRESH: u8 = 6; // Tolerate reordering on high-latency links.
 
 // Chunk Types
 const CT_DATA: u8 = 0;
@@ -607,10 +608,10 @@ impl SctpInner {
         }
         let srtt = self.rto_state.lock().unwrap().srtt;
         if srtt == 0.0 {
-            return 20;
+            return 50;
         }
-        let ms = (srtt * 1000.0 * 0.25).round() as u32;
-        ms.clamp(10, 50)
+        let ms = (srtt * 1000.0 * 0.5).round() as u32;
+        ms.clamp(20, 200)
     }
 
     fn gap_signature(&self, cumulative_tsn_ack: u32) -> u32 {
