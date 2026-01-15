@@ -96,6 +96,7 @@ struct RtoCalculator {
     rto: f64,
     min: f64,
     max: f64,
+    last_rtt: Option<f64>,
 }
 
 impl RtoCalculator {
@@ -106,10 +107,12 @@ impl RtoCalculator {
             rto: initial,
             min,
             max,
+            last_rtt: None,
         }
     }
 
     fn update(&mut self, rtt: f64) {
+        self.last_rtt = Some(rtt);
         if self.srtt == 0.0 {
             self.srtt = rtt;
             self.rttvar = rtt / 2.0;
@@ -122,6 +125,10 @@ impl RtoCalculator {
 
     fn backoff(&mut self) {
         self.rto = (self.rto * 2.0).min(self.max);
+    }
+
+    fn last_rtt(&self) -> Option<f64> {
+        self.last_rtt
     }
 }
 
@@ -592,6 +599,15 @@ impl SctpTransport {
 
     pub fn buffered_amount(&self) -> usize {
         self.inner.flight_size.load(Ordering::SeqCst)
+    }
+
+    pub fn smoothed_rtt(&self) -> Option<f64> {
+        let srtt = self.inner.rto_state.lock().unwrap().srtt;
+        if srtt == 0.0 { None } else { Some(srtt) }
+    }
+
+    pub fn last_rtt(&self) -> Option<f64> {
+        self.inner.rto_state.lock().unwrap().last_rtt()
     }
 }
 

@@ -2,7 +2,7 @@ use crate::media::track::{MediaStreamTrack, SampleStreamSource, SampleStreamTrac
 use crate::rtp::{
     FirRequest, FullIntraRequest, GenericNack, PictureLossIndication, RtcpPacket, RtpPacket,
 };
-use crate::stats::{StatsReport, gather_once};
+use crate::stats::{StatsEntry, StatsId, StatsKind, StatsReport, gather_once};
 use crate::stats_collector::StatsCollector;
 use crate::transports::dtls::{self, DtlsTransport};
 use crate::transports::get_local_ip;
@@ -15,6 +15,7 @@ use crate::{
     RtcError, RtcResult, SdpType, SessionDescription, TransportMode, VideoCapability,
 };
 use base64::prelude::*;
+use serde_json::json;
 use std::collections::{HashMap, VecDeque};
 use std::net::{IpAddr, Ipv4Addr};
 use std::{
@@ -1812,7 +1813,28 @@ impl PeerConnection {
     }
 
     pub async fn get_stats(&self) -> RtcResult<StatsReport> {
-        gather_once(&[self.inner.stats_collector.clone()]).await
+        let mut report = gather_once(&[self.inner.stats_collector.clone()]).await?;
+        let transport = self.inner.sctp_transport.lock().unwrap().clone();
+        if let Some(transport) = transport {
+            let srtt = transport.smoothed_rtt();
+            let last_rtt = transport.last_rtt();
+            if srtt.is_some() || last_rtt.is_some() {
+                let mut entry =
+                    StatsEntry::new(StatsId::new("sctp-transport"), StatsKind::DataChannel);
+                if let Some(srtt) = srtt {
+                    entry = entry
+                        .with_value("currentRoundTripTime", json!(srtt))
+                        .with_value("sctpSmoothedRtt", json!(srtt));
+                }
+                if let Some(last_rtt) = last_rtt {
+                    entry = entry
+                        .with_value("lastRoundTripTime", json!(last_rtt))
+                        .with_value("sctpLastRtt", json!(last_rtt));
+                }
+                report.entries.push(entry);
+            }
+        }
+        Ok(report)
     }
 
     pub async fn wait_for_gathering_complete(&self) {
