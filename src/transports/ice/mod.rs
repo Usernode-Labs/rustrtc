@@ -28,6 +28,8 @@ use self::stun::{
 use crate::{IceServer, IceTransportPolicy, RtcConfiguration};
 
 pub(crate) const MAX_STUN_MESSAGE: usize = 1500;
+const CHECK_RETRY_BASE: Duration = Duration::from_millis(500);
+const CHECK_RETRY_MAX: Duration = Duration::from_secs(5);
 
 #[cfg(any(test, feature = "simulator"))]
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -88,6 +90,8 @@ struct IceTransportInner {
     local_parameters: std::sync::Mutex<IceParameters>,
     remote_parameters: std::sync::Mutex<Option<IceParameters>>,
     remote_tie_breaker: std::sync::Mutex<Option<u64>>,
+    ice_start: std::sync::Mutex<Option<Instant>>,
+    check_retry_delay: std::sync::Mutex<Duration>,
     pending_transactions: std::sync::Mutex<HashMap<[u8; 12], oneshot::Sender<StunDecoded>>>,
     data_receiver: std::sync::Mutex<Option<Arc<dyn PacketReceiver>>>,
     buffered_packets: std::sync::Mutex<Vec<(Vec<u8>, SocketAddr)>>,
@@ -377,6 +381,8 @@ impl IceTransport {
             local_parameters: std::sync::Mutex::new(IceParameters::generate()),
             remote_parameters: std::sync::Mutex::new(None),
             remote_tie_breaker: std::sync::Mutex::new(None),
+            ice_start: std::sync::Mutex::new(None),
+            check_retry_delay: std::sync::Mutex::new(CHECK_RETRY_BASE),
             pending_transactions: std::sync::Mutex::new(HashMap::new()),
             data_receiver: std::sync::Mutex::new(None),
             buffered_packets: std::sync::Mutex::new(Vec::new()),
@@ -467,11 +473,19 @@ impl IceTransport {
         self.start_gathering()?;
         self.start_keepalive();
         {
+            let mut start = self.inner.ice_start.lock().unwrap();
+            *start = Some(Instant::now());
+        }
+        {
             let mut params = self.inner.remote_parameters.lock().unwrap();
             *params = Some(remote);
         }
         if let Err(e) = self.inner.state.send(IceTransportState::Checking) {
             warn!("start: failed to set state to Checking: {}", e);
+        }
+        {
+            let mut delay = self.inner.check_retry_delay.lock().unwrap();
+            *delay = CHECK_RETRY_BASE;
         }
         self.try_connectivity_checks();
         Ok(())
@@ -559,6 +573,10 @@ impl IceTransport {
     }
 
     pub fn add_remote_candidate(&self, candidate: IceCandidate) {
+        {
+            let mut delay = self.inner.check_retry_delay.lock().unwrap();
+            *delay = CHECK_RETRY_BASE;
+        }
         let mut list = self.inner.remote_candidates.lock().unwrap();
         list.push(candidate);
         drop(list);
@@ -787,6 +805,10 @@ async fn perform_connectivity_checks_async(inner: Arc<IceTransportInner>) {
             }
             let _ = inner.state.send(IceTransportState::Connected);
             success = true;
+            {
+                let mut delay = inner.check_retry_delay.lock().unwrap();
+                *delay = CHECK_RETRY_BASE;
+            }
             debug!(
                 "ICE checks complete. Selected pair: {} -> {}",
                 pair.local.address, pair.remote.address
@@ -823,7 +845,37 @@ async fn perform_connectivity_checks_async(inner: Arc<IceTransportInner>) {
         let has_selected_pair = inner.selected_pair.lock().unwrap().is_some();
         // Only set Failed if we're not already connected AND we don't have a working pair
         if state != IceTransportState::Connected && !has_selected_pair {
-            let _ = inner.state.send(IceTransportState::Failed);
+            let elapsed = inner
+                .ice_start
+                .lock()
+                .unwrap()
+                .map(|t| t.elapsed())
+                .unwrap_or(Duration::ZERO);
+            let timeout = inner.config.ice_connection_timeout;
+            if elapsed >= timeout {
+                let _ = inner.state.send(IceTransportState::Failed);
+            } else {
+                let remaining = timeout.checked_sub(elapsed).unwrap_or(Duration::ZERO);
+                let retry_delay = {
+                    let mut delay = inner.check_retry_delay.lock().unwrap();
+                    let retry_delay = *delay;
+                    let doubled = retry_delay + retry_delay;
+                    *delay = if retry_delay >= CHECK_RETRY_MAX {
+                        CHECK_RETRY_MAX
+                    } else if doubled > CHECK_RETRY_MAX {
+                        CHECK_RETRY_MAX
+                    } else {
+                        doubled
+                    };
+                    retry_delay
+                };
+                let retry_delay = std::cmp::min(retry_delay, remaining);
+                let inner_clone = inner.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(retry_delay).await;
+                    let _ = inner_clone.cmd_tx.send(IceCommand::RunChecks);
+                });
+            }
         }
     }
 }
