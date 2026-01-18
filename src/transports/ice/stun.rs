@@ -103,6 +103,8 @@ pub struct StunDecoded {
     pub xor_relayed_address: Option<SocketAddr>,
     pub xor_peer_address: Option<SocketAddr>,
     pub error_code: Option<u16>,
+    pub ice_controlling: Option<u64>,
+    pub ice_controlled: Option<u64>,
     pub realm: Option<String>,
     pub nonce: Option<String>,
     pub data: Option<Vec<u8>>,
@@ -316,6 +318,8 @@ fn decode_stun_message(bytes: &[u8]) -> Result<StunDecoded> {
     let mut xor_relayed_address = None;
     let mut xor_peer_address = None;
     let mut error_code = None;
+    let mut ice_controlling = None;
+    let mut ice_controlled = None;
     let mut realm = None;
     let mut nonce = None;
     let mut data = None;
@@ -350,6 +354,20 @@ fn decode_stun_message(bytes: &[u8]) -> Result<StunDecoded> {
                     error_code = Some(code);
                 }
             }
+            0x802A => {
+                if value.len() >= 8 {
+                    let mut buf = [0u8; 8];
+                    buf.copy_from_slice(&value[..8]);
+                    ice_controlling = Some(u64::from_be_bytes(buf));
+                }
+            }
+            0x8029 => {
+                if value.len() >= 8 {
+                    let mut buf = [0u8; 8];
+                    buf.copy_from_slice(&value[..8]);
+                    ice_controlled = Some(u64::from_be_bytes(buf));
+                }
+            }
             0x0014 => {
                 if let Ok(text) = std::str::from_utf8(value) {
                     realm = Some(text.to_string());
@@ -379,6 +397,8 @@ fn decode_stun_message(bytes: &[u8]) -> Result<StunDecoded> {
         xor_relayed_address,
         xor_peer_address,
         error_code,
+        ice_controlling,
+        ice_controlled,
         realm,
         nonce,
         data,
