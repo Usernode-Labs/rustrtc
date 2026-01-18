@@ -1000,7 +1000,7 @@ async fn handle_packet(
                     trace!("Received STUN Error Response from {}", addr);
                     match msg.error_code {
                         Some(487) => {
-                            handle_role_conflict(&inner, &msg, addr);
+                            handle_role_conflict(&inner, &msg, addr).await;
                         }
                         Some(401) => {
                             warn!(
@@ -1166,7 +1166,7 @@ async fn handle_stun_request(
     }
 }
 
-fn handle_role_conflict(inner: &Arc<IceTransportInner>, msg: &StunDecoded, addr: SocketAddr) {
+async fn handle_role_conflict(inner: &Arc<IceTransportInner>, msg: &StunDecoded, addr: SocketAddr) {
     let remote_tie = msg
         .ice_controlling
         .or(msg.ice_controlled)
@@ -1195,18 +1195,24 @@ fn handle_role_conflict(inner: &Arc<IceTransportInner>, msg: &StunDecoded, addr:
         IceRole::Controlled
     };
 
-    let mut role = inner.role.lock().unwrap();
-    if *role == desired_role {
-        debug!(
-            "ICE role conflict (487) from {} resolved: local={} remote={} role={:?}",
-            addr, local_tie, remote_tie, desired_role
-        );
-        return;
-    }
+    let previous = {
+        let mut role = inner.role.lock().unwrap();
+        if *role == desired_role {
+            debug!(
+                "ICE role conflict (487) from {} resolved: local={} remote={} role={:?}",
+                addr, local_tie, remote_tie, desired_role
+            );
+            return;
+        }
+        let previous = *role;
+        *role = desired_role;
+        previous
+    };
 
-    let previous = *role;
-    *role = desired_role;
-    drop(role);
+    {
+        let mut checking = inner.checking_pairs.lock().await;
+        checking.clear();
+    }
 
     let _ = inner.cmd_tx.send(IceCommand::RunChecks);
     info!(
