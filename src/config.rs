@@ -240,6 +240,8 @@ pub struct RtcConfiguration {
     pub external_ip: Option<String>,
     pub bind_ip: Option<String>,
     pub disable_ipv6: bool,
+    #[serde(default)]
+    pub filter_private_host_candidates: bool,
     pub ssrc_start: u32,
     pub stun_timeout: std::time::Duration,
     pub ice_connection_timeout: std::time::Duration,
@@ -268,6 +270,7 @@ impl Default for RtcConfiguration {
             external_ip: None,
             bind_ip: None,
             disable_ipv6: false,
+            filter_private_host_candidates: false,
             ssrc_start: 10000,
             stun_timeout: std::time::Duration::from_secs(5),
             ice_connection_timeout: std::time::Duration::from_secs(30),
@@ -353,6 +356,11 @@ impl RtcConfigurationBuilder {
 
     pub fn disable_ipv6(mut self, disable: bool) -> Self {
         self.inner.disable_ipv6 = disable;
+        self
+    }
+
+    pub fn filter_private_host_candidates(mut self, enable: bool) -> Self {
+        self.inner.filter_private_host_candidates = enable;
         self
     }
 
