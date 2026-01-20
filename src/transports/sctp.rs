@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, AtomicUsize,
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 use tokio::sync::{Notify, mpsc};
-use tracing::{debug, info, trace, warn};
+use tracing::{debug, trace, warn};
 
 // RTO Constants (RFC 4960)
 const RTO_ALPHA: f64 = 0.125;
