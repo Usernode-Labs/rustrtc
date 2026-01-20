@@ -17,6 +17,7 @@ pub struct RtpTransport {
     listeners: Mutex<HashMap<u32, mpsc::Sender<RtpPacket>>>,
     rtcp_listener: Mutex<Option<mpsc::Sender<Vec<RtcpPacket>>>>,
     rid_listeners: Mutex<HashMap<String, mpsc::Sender<RtpPacket>>>,
+    pt_listeners: Mutex<HashMap<u8, mpsc::Sender<RtpPacket>>>,
     provisional_listener: Mutex<Option<mpsc::Sender<RtpPacket>>>,
     rid_extension_id: Mutex<Option<u8>>,
     abs_send_time_extension_id: Mutex<Option<u8>>,
@@ -31,6 +32,7 @@ impl RtpTransport {
             listeners: Mutex::new(HashMap::new()),
             rtcp_listener: Mutex::new(None),
             rid_listeners: Mutex::new(HashMap::new()),
+            pt_listeners: Mutex::new(HashMap::new()),
             provisional_listener: Mutex::new(None),
             rid_extension_id: Mutex::new(None),
             abs_send_time_extension_id: Mutex::new(None),
@@ -60,6 +62,11 @@ impl RtpTransport {
     pub fn register_rid_listener(&self, rid: String, tx: mpsc::Sender<RtpPacket>) {
         let mut listeners = self.rid_listeners.lock().unwrap();
         listeners.insert(rid, tx);
+    }
+
+    pub fn register_pt_listener(&self, pt: u8, tx: mpsc::Sender<RtpPacket>) {
+        let mut listeners = self.pt_listeners.lock().unwrap();
+        listeners.insert(pt, tx);
     }
 
     pub fn register_provisional_listener(&self, tx: mpsc::Sender<RtpPacket>) {
@@ -277,6 +284,13 @@ impl PacketReceiver for RtpTransport {
                     if listener.is_none() {
                         let listeners = self.listeners.lock().unwrap();
                         listener = listeners.get(&ssrc).cloned();
+                    }
+
+                    // Fallback to Payload Type listener
+                    if listener.is_none() {
+                        let pt = rtp_packet.header.payload_type;
+                        let pt_listeners = self.pt_listeners.lock().unwrap();
+                        listener = pt_listeners.get(&pt).cloned();
                     }
 
                     // Fallback to provisional listener (and bind SSRC)

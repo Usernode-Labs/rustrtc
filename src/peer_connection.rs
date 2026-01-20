@@ -697,6 +697,18 @@ impl PeerConnection {
                     // Also extract direction
                     let direction: TransceiverDirection = section.direction.into();
                     t.set_direction(direction);
+
+                    // Assign MID if not yet assigned
+                    if t.mid().is_none() {
+                        t.set_mid(section.mid.clone());
+                    }
+
+                    // Extract SSRC if present
+                    if let Some(receiver) = t.receiver() {
+                        if let Some(ssrc) = Self::extract_ssrc_from_section(section) {
+                            receiver.set_ssrc(ssrc);
+                        }
+                    }
                 }
             }
         } else {
@@ -1827,14 +1839,24 @@ impl PeerConnection {
                     let new_ssrc = Self::extract_ssrc_from_section(section);
                     if let Some(new_ssrc) = new_ssrc {
                         let old_ssrc = receiver.ssrc();
-                        if old_ssrc != 0 && old_ssrc != new_ssrc {
-                            warn!(
-                                "SSRC changed for mid={} ({} -> {}), this should be treated as new track",
-                                section.mid, old_ssrc, new_ssrc
-                            );
-                            // For now, log warning and continue. In full implementation,
-                            // this should create a new receiver/track
+                        if old_ssrc != new_ssrc {
+                            if old_ssrc != 0 {
+                                warn!(
+                                    "SSRC changed for mid={} ({} -> {}), updating listener",
+                                    section.mid, old_ssrc, new_ssrc
+                                );
+                            } else {
+                                debug!(
+                                    "SSRC learned for mid={} (-> {}), updating listener",
+                                    section.mid, new_ssrc
+                                );
+                            }
+                            receiver.set_ssrc(new_ssrc);
                         }
+                    } else {
+                        // If no SSRC in SDP, re-enable provisional listener
+                        // to handle potential SSRC changes during reinvite
+                        receiver.ensure_provisional_listener();
                     }
                 }
 
@@ -3072,7 +3094,21 @@ impl RtpTransceiver {
             }
         }
 
-        *payload_map = new_map;
+        *payload_map = new_map.clone();
+
+        // Update PT listeners in transport for fallback routing
+        if let Some(receiver) = self.receiver() {
+            if let Some(transport_weak) = self.rtp_transport.lock().unwrap().clone() {
+                if let Some(transport) = transport_weak.upgrade() {
+                    if let Some(tx) = receiver.packet_tx() {
+                        for (&pt, _) in &new_map {
+                            transport.register_pt_listener(pt, tx.clone());
+                        }
+                    }
+                }
+            }
+        }
+
         Ok(())
     }
 
@@ -3598,6 +3634,10 @@ impl RtpReceiver {
         *self.ssrc.lock().unwrap()
     }
 
+    pub fn packet_tx(&self) -> Option<mpsc::Sender<RtpPacket>> {
+        self.packet_tx.lock().unwrap().clone()
+    }
+
     pub fn rtx_ssrc(&self) -> Option<u32> {
         *self.rtx_ssrc.lock().unwrap()
     }
@@ -3611,6 +3651,17 @@ impl RtpReceiver {
             && let Some(tx) = packet_tx
         {
             transport.register_listener_sync(ssrc, tx);
+        }
+    }
+
+    pub fn ensure_provisional_listener(&self) {
+        let transport = self.transport.lock().unwrap().clone();
+        let packet_tx = self.packet_tx.lock().unwrap().clone();
+
+        if let Some(transport) = transport
+            && let Some(tx) = packet_tx
+        {
+            transport.register_provisional_listener(tx);
         }
     }
 
@@ -3631,6 +3682,11 @@ impl RtpReceiver {
         let ssrc = *self.ssrc.lock().unwrap();
         transport.register_listener_sync(ssrc, tx.clone());
         transport.register_provisional_listener(tx.clone());
+
+        // Also register current payload type as a fallback
+        let pt = self.params.lock().unwrap().payload_type;
+        transport.register_pt_listener(pt, tx.clone());
+
         *self.packet_tx.lock().unwrap() = Some(tx);
 
         initial_tracks.push(ReceiverCommand::AddTrack {
