@@ -16,8 +16,8 @@ const RTO_ALPHA: f64 = 0.125;
 const RTO_BETA: f64 = 0.25;
 
 // Flow Control Constants
-const CWND_INITIAL: usize = 1200 * 4; // Start with 4 MTUs (~4.8KB, RFC compliant)
-const MAX_BURST: usize = 4; // RFC 4960 Section 7.2.4
+const CWND_INITIAL: usize = 1200 * 10; // Start with 10 MTUs (~12KB, RFC 6928)
+const SSTHRESH_MIN: usize = CWND_INITIAL / 3; // Minimum ssthresh: 1/3 of initial cwnd (~4KB)
 
 #[derive(Debug, Clone)]
 struct ChunkRecord {
@@ -598,7 +598,7 @@ impl SctpInner {
 
         let mut sack_deadline: Option<Instant> = None;
         let mut last_heartbeat = Instant::now();
-        let heartbeat_interval = Duration::from_secs(30);
+        let heartbeat_interval = Duration::from_secs(15);
 
         loop {
             // Check if state was changed to Closed by timeout handler
@@ -773,8 +773,6 @@ impl SctpInner {
                 return Ok(());
             }
 
-            // If we are here, at least one packet timed out.
-            // RFC 4960 Section 6.3.3 (E2): Adjust flight_size to 0 for this destination.
             for record in sent_queue.values_mut() {
                 if record.in_flight {
                     record.in_flight = false;
@@ -785,8 +783,6 @@ impl SctpInner {
                         })
                         .ok();
                 }
-                // CRITICAL: Restart the T3-rtx timer for ALL outstanding chunks
-                // to prevent "RTO explosions" where chunks time out one by one in 10ms intervals.
                 if !record.acked {
                     record.sent_time = now;
                     record.missing_reports = 0;
@@ -795,13 +791,11 @@ impl SctpInner {
             }
             self.flow_control_notify.notify_waiters();
 
-            // Clear cached RTO timeout to force immediate recalculation in run_loop
             {
                 let mut cached = self.cached_rto_timeout.lock().unwrap();
                 *cached = None;
             }
 
-            // Collect channel info once to avoid locking in the loop
             let channel_info: std::collections::HashMap<u16, Option<u16>> = {
                 let channels = self.data_channels.lock().unwrap();
                 channels
@@ -839,12 +833,21 @@ impl SctpInner {
                         to_retransmit.push((*tsn, record.payload.clone()));
                         current_len += record.payload.len();
                         record.transmit_count += 1;
+                        record.sent_time = now;
+                        // Mark as in_flight for immediate retransmission
+                        if !record.in_flight {
+                            self.flight_size
+                                .fetch_add(record.payload.len(), Ordering::SeqCst);
+                        }
                         record.in_flight = true;
-                        self.flight_size
-                            .fetch_add(record.payload.len(), Ordering::SeqCst);
                     } else {
-                        // The rest will be handled by drain_retransmissions() as cwnd/rwnd allows.
-                        break;
+                        // CRITICAL: Mark as NOT in_flight so drain_retransmissions can handle it
+                        // These chunks will be retransmitted by drain_retransmissions() as cwnd/rwnd allows
+                        if record.in_flight {
+                            self.flight_size
+                                .fetch_sub(record.payload.len(), Ordering::SeqCst);
+                            record.in_flight = false;
+                        }
                     }
                 }
             }
@@ -873,22 +876,35 @@ impl SctpInner {
             {
                 let mut rto_state = self.rto_state.lock().unwrap();
                 rto_state.backoff();
-                debug!(
-                    "SCTP RTO Timeout! Backoff RTO to {}s, retransmitting {} head chunks. Flight size reset.",
-                    rto_state.rto,
-                    to_retransmit.len()
-                );
+                let chunk_count = to_retransmit.len();
+                if chunk_count > 5 {
+                    debug!(
+                        "SCTP RTO Timeout! Backoff RTO to {}s, retransmitting {} chunks, error count: {}/{}",
+                        rto_state.rto, chunk_count, error_count, self.max_association_retransmits
+                    );
+                } else {
+                    debug!(
+                        "SCTP RTO Timeout! Backoff RTO to {}s, retransmitting {} head chunks. Flight size reset. error count: {}/{}",
+                        rto_state.rto, chunk_count, error_count, self.max_association_retransmits
+                    );
+                }
             }
 
-            // Reduce ssthresh and cwnd (RFC 4960 / Modern TCP)
+            // Reduce ssthresh and cwnd (RFC 4960)
             let cwnd = self.cwnd.load(Ordering::SeqCst);
-            let new_ssthresh = (cwnd / 2).max(MAX_SCTP_PACKET_SIZE * 4); // Standard minimum ssthresh
+            let new_ssthresh = (cwnd / 2).max(SSTHRESH_MIN);
             self.ssthresh.store(new_ssthresh, Ordering::SeqCst);
-            self.cwnd.store(MAX_SCTP_PACKET_SIZE, Ordering::SeqCst); // Reset to 1 MTU on timeout
+            // RFC 4960: Set cwnd to 1*MTU after RTO timeout (most conservative restart)
+            let new_cwnd = MAX_SCTP_PACKET_SIZE;
+            self.cwnd.store(new_cwnd, Ordering::SeqCst);
             self.partial_bytes_acked.store(0, Ordering::SeqCst);
             self.fast_recovery_active.store(false, Ordering::SeqCst);
             // Exit Fast Recovery on timeout
             self.fast_recovery_exit_tsn.store(0, Ordering::SeqCst);
+            debug!(
+                "Congestion Control: RTO timeout, cwnd {} -> {}, ssthresh {}",
+                cwnd, new_cwnd, new_ssthresh
+            );
 
             // Retransmit expired chunks
             let chunks: Vec<Bytes> = to_retransmit.into_iter().map(|(_, p)| p).collect();
@@ -1073,6 +1089,7 @@ impl SctpInner {
                     let mut sent_time = self.heartbeat_sent_time.lock().unwrap();
                     if let Some(start) = *sent_time {
                         let rtt = now.duration_since(start).as_secs_f64();
+                        debug!("SCTP Heartbeat RTT: {:.3}s", rtt);
                         self.update_rto(rtt);
                         *sent_time = None;
                     }
@@ -1080,17 +1097,21 @@ impl SctpInner {
                 CT_FORWARD_TSN => self.handle_forward_tsn(chunk_value).await?,
                 CT_RECONFIG => self.handle_reconfig(chunk_value).await?,
                 CT_ABORT => {
-                    debug!("SCTP ABORT received");
+                    let error_count = self.association_error_count.load(Ordering::SeqCst);
+                    debug!(
+                        "SCTP ABORT received from remote peer (our error_count was {}/{}). Remote may have different max_association_retransmits limit.",
+                        error_count, self.max_association_retransmits
+                    );
                     self.set_state(SctpState::Closed);
                 }
                 CT_SHUTDOWN => {
-                    debug!("SCTP SHUTDOWN received");
+                    debug!("SCTP SHUTDOWN received from remote peer");
                     let tag = self.remote_verification_tag.load(Ordering::SeqCst);
                     self.send_chunk(CT_SHUTDOWN_ACK, 0, Bytes::new(), tag)
                         .await?;
                 }
                 CT_SHUTDOWN_ACK => {
-                    debug!("SCTP SHUTDOWN ACK received");
+                    debug!("SCTP SHUTDOWN ACK received, closing connection");
                     self.set_state(SctpState::Closed);
                 }
                 _ => {
@@ -1295,6 +1316,23 @@ impl SctpInner {
 
             if outcome.bytes_acked_by_cum_tsn > 0 || !outcome.rtt_samples.is_empty() {
                 self.association_error_count.store(0, Ordering::SeqCst);
+
+                // If we successfully received ACKs and ssthresh is at minimum, gradually increase it
+                // This helps recover faster in lossy networks
+                let ssthresh = self.ssthresh.load(Ordering::SeqCst);
+                if ssthresh == SSTHRESH_MIN && outcome.bytes_acked_by_cum_tsn > 0 {
+                    let cwnd = self.cwnd.load(Ordering::SeqCst);
+                    // If cwnd is approaching ssthresh (within 20%), allow it to grow further
+                    if cwnd >= ssthresh * 4 / 5 {
+                        // Raise ssthresh to 50% of initial cwnd (6KB), allowing controlled growth
+                        let new_ssthresh = CWND_INITIAL / 2;
+                        self.ssthresh.store(new_ssthresh, Ordering::SeqCst);
+                        debug!(
+                            "Raising ssthresh {} -> {} to allow faster recovery",
+                            ssthresh, new_ssthresh
+                        );
+                    }
+                }
             }
 
             for rtt in outcome.rtt_samples {
@@ -1330,17 +1368,21 @@ impl SctpInner {
                 if in_fast_recovery {
                     // In Fast Recovery, we don't increase cwnd normally.
                 } else if cwnd < ssthresh {
-                    // Slow Start: cwnd += bytes_acked (only for cumulative ack advancement)
+                    // Slow Start: cwnd += bytes_acked (exponential growth)
+                    // RFC 4960: limit growth to avoid overshooting network capacity
                     if outcome.bytes_acked_by_cum_tsn > 0 {
-                        let increase = outcome
-                            .bytes_acked_by_cum_tsn
-                            .min(MAX_BURST * MAX_SCTP_PACKET_SIZE);
+                        // Limit single ACK increase to 2*MTU for more controlled growth
+                        // This reduces the risk of overshoot while maintaining fast recovery
+                        let increase = outcome.bytes_acked_by_cum_tsn.min(MAX_SCTP_PACKET_SIZE * 2);
                         let old_cwnd = self.cwnd.fetch_add(increase, Ordering::SeqCst);
-                        trace!(
-                            "Congestion Control: Slow Start cwnd increase {} -> {}",
-                            old_cwnd,
-                            old_cwnd + increase
-                        );
+                        let new_cwnd = old_cwnd + increase;
+                        // Log when cwnd doubles to track growth
+                        if new_cwnd >= old_cwnd * 2 || old_cwnd < MAX_SCTP_PACKET_SIZE * 3 {
+                            debug!(
+                                "Congestion Control: Slow Start cwnd {} -> {} (ssthresh={}, increase={})",
+                                old_cwnd, new_cwnd, ssthresh, increase
+                            );
+                        }
                     }
                 } else {
                     // Congestion Avoidance: cwnd += MTU per RTT
@@ -1381,7 +1423,7 @@ impl SctpInner {
                 if !in_fast_recovery {
                     // Enter Fast Recovery
                     let cwnd = self.cwnd.load(Ordering::SeqCst);
-                    let new_ssthresh = (cwnd / 2).max(MAX_SCTP_PACKET_SIZE * 4);
+                    let new_ssthresh = (cwnd / 2).max(SSTHRESH_MIN);
                     self.ssthresh.store(new_ssthresh, Ordering::SeqCst);
                     self.cwnd.store(new_ssthresh, Ordering::SeqCst);
                     self.partial_bytes_acked.store(0, Ordering::SeqCst);
@@ -1661,20 +1703,31 @@ impl SctpInner {
         {
             let mut sent_time = self.heartbeat_sent_time.lock().unwrap();
             if sent_time.is_some() {
-                // Heartbeat already in flight, increment error count
-                let error_count = self.association_error_count.fetch_add(1, Ordering::SeqCst) + 1;
-                if error_count >= self.max_association_retransmits
-                    && self.max_association_retransmits > 0
-                {
-                    warn!(
-                        "SCTP Association heartbeat timeout limit reached ({}), closing",
-                        self.max_association_retransmits
+                let rto = self.rto_state.lock().unwrap().rto;
+                let is_rto_backing_off = rto > 2.0;
+                if !is_rto_backing_off {
+                    let error_count =
+                        self.association_error_count.fetch_add(1, Ordering::SeqCst) + 1;
+                    debug!(
+                        "SCTP Heartbeat timeout! Error count: {}/{}",
+                        error_count, self.max_association_retransmits
                     );
-                    self.set_state(SctpState::Closed);
-                    return Ok(());
+                    if error_count >= self.max_association_retransmits
+                        && self.max_association_retransmits > 0
+                    {
+                        warn!(
+                            "SCTP Association heartbeat timeout limit reached ({}), closing",
+                            self.max_association_retransmits
+                        );
+                        self.set_state(SctpState::Closed);
+                        return Ok(());
+                    }
+                } else {
+                    debug!(
+                        "SCTP Heartbeat timeout (RTO={:.1}s is backing off, not counting as error)",
+                        rto
+                    );
                 }
-                // Backoff RTO
-                self.rto_state.lock().unwrap().backoff();
             }
             *sent_time = Some(now);
         }
@@ -1688,12 +1741,13 @@ impl SctpInner {
         if tag == 0 {
             return Ok(()); // Not connected yet
         }
+        trace!("Sending SCTP Heartbeat");
         self.send_chunk(CT_HEARTBEAT, 0, buf.freeze(), tag).await
     }
 
     async fn handle_heartbeat(&self, chunk: Bytes) -> Result<()> {
         // Send HEARTBEAT ACK with same info
-        // ...
+        trace!("Received SCTP Heartbeat, sending ACK");
 
         let tag = self.remote_verification_tag.load(Ordering::SeqCst);
         self.send_chunk(CT_HEARTBEAT_ACK, 0, chunk, tag).await?;
