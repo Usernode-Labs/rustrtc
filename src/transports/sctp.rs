@@ -289,6 +289,18 @@ fn apply_sack_to_sent_queue(
         }
     }
 
+    // Debug: Log SACK details when there are gaps
+    if !gap_blocks.is_empty() {
+        let outstanding_tsns: Vec<u32> = sent_queue.keys().take(5).cloned().collect();
+        debug!(
+            "SACK: cum_ack={}, max_reported={}, gaps={}, outstanding_tsns[0..5]={:?}",
+            cumulative_tsn_ack,
+            max_reported,
+            gap_blocks.len(),
+            outstanding_tsns
+        );
+    }
+
     let mut outcome = SackOutcome::default();
     outcome.max_reported = max_reported;
 
@@ -357,11 +369,26 @@ fn apply_sack_to_sent_queue(
     // 3. Mark missing reports and schedule fast retransmits.
     // Use order-aware iteration up to max_reported.
     let mut to_retransmit = Vec::new();
+    let mut missing_count = 0;
     for (&tsn, record) in sent_queue.iter_mut() {
         // if tsn <= max_reported
         if (tsn.wrapping_sub(max_reported) as i32) <= 0 {
             if !record.acked {
+                missing_count += 1;
+                let old_reports = record.missing_reports;
                 record.missing_reports = record.missing_reports.saturating_add(1);
+
+                // Log first few missing TSNs
+                if missing_count <= 3 {
+                    debug!(
+                        "Missing TSN {} reports: {} -> {}, acked={}, fast_retrans={}",
+                        tsn,
+                        old_reports,
+                        record.missing_reports,
+                        record.acked,
+                        record.fast_retransmit
+                    );
+                }
 
                 if record.missing_reports >= DUP_THRESH
                     && !record.abandoned
@@ -372,11 +399,23 @@ fn apply_sack_to_sent_queue(
                     record.sent_time = now; // Reset timer for retransmission
                     record.fast_retransmit = true;
 
+                    debug!(
+                        "Fast retransmit triggered for TSN {} after {} missing reports",
+                        tsn, DUP_THRESH
+                    );
+
                     // Note: We do NOT remove from in_flight or reduce flight_size here per spec.
                     to_retransmit.push((tsn, record.payload.clone()));
                 }
             }
         }
+    }
+
+    if missing_count > 0 && to_retransmit.is_empty() {
+        debug!(
+            "Found {} missing TSNs but none reached fast retransmit threshold",
+            missing_count
+        );
     }
     outcome.retransmit = to_retransmit;
 
@@ -753,15 +792,12 @@ impl SctpInner {
     async fn handle_timeout(&self) -> Result<()> {
         let mut to_retransmit = Vec::new();
         let mut abandoned_tsn: Option<u32> = None;
-        let retransmit_size; // Track total size of retransmit batch
+        let retransmit_size;
 
-        // 1. Collect all expired chunks and backoff RTO once
         let now = Instant::now();
         let rto = { self.rto_state.lock().unwrap().rto };
         {
             let mut sent_queue = self.sent_queue.lock().unwrap();
-
-            // Check if anything has expired
             let mut any_expired = false;
             for record in sent_queue.values() {
                 if !record.acked && now >= record.sent_time + Duration::from_secs_f64(rto) {
@@ -805,16 +841,15 @@ impl SctpInner {
                     .collect()
             };
 
+            let cwnd_for_retrans = MAX_SCTP_PACKET_SIZE * 2;
             let mut current_len: usize = 0;
-            let max_packet_payload = MAX_SCTP_PACKET_SIZE - SCTP_COMMON_HEADER_SIZE;
-            let mut retransmit_batch_size: usize = 0; // Track total size to add back to flight_size
+            let mut retransmit_batch_size: usize = 0;
 
             for (tsn, record) in sent_queue.iter_mut() {
                 if record.acked {
                     continue;
                 }
 
-                // Check for abandonment
                 let mut abandoned = false;
                 if let Some(Some(max_rexmit)) = channel_info.get(&record.stream_id) {
                     if record.transmit_count >= *max_rexmit as u32 {
@@ -828,10 +863,7 @@ impl SctpInner {
                         abandoned_tsn = Some(*tsn);
                     }
                 } else {
-                    // RFC 4960 Section 6.3.3: Retransmit only the earliest outstanding DATA chunks
-                    // that fit into a single packet of size MTU.
-                    if current_len == 0 || current_len + record.payload.len() <= max_packet_payload
-                    {
+                    if current_len + record.payload.len() <= cwnd_for_retrans {
                         to_retransmit.push((*tsn, record.payload.clone()));
                         current_len += record.payload.len();
                         retransmit_batch_size += record.payload.len();
@@ -839,17 +871,12 @@ impl SctpInner {
                         record.sent_time = now;
                         record.in_flight = true;
                     } else {
-                        // These chunks will be retransmitted by drain_retransmissions()
                         record.in_flight = false;
                     }
                 }
             }
 
-            // Save retransmit_size to outer scope
             retransmit_size = retransmit_batch_size;
-
-            // Note: At this point all in_flight flags are false and flight_size is 0
-            // We will add retransmit_size back after setting cwnd
         }
 
         if let Some(tsn) = abandoned_tsn {
@@ -858,20 +885,20 @@ impl SctpInner {
         }
 
         if !to_retransmit.is_empty() {
-            // Increment association error count (RFC 4960 Section 8.1)
             let error_count = self.association_error_count.fetch_add(1, Ordering::SeqCst) + 1;
             if error_count >= self.max_association_retransmits
                 && self.max_association_retransmits > 0
             {
+                let rto_state = self.rto_state.lock().unwrap();
                 warn!(
-                    "SCTP Association RTO limit reached ({}), closing",
-                    self.max_association_retransmits
+                    "SCTP Association RTO limit reached ({}/{}), RTO={:.1}s, closing connection",
+                    error_count, self.max_association_retransmits, rto_state.rto
                 );
+                drop(rto_state);
                 self.set_state(SctpState::Closed);
                 return Ok(());
             }
 
-            // Backoff RTO once per timer tick
             {
                 let mut rto_state = self.rto_state.lock().unwrap();
                 rto_state.backoff();
@@ -889,40 +916,32 @@ impl SctpInner {
                 }
             }
 
-            // Reduce ssthresh and cwnd (RFC 4960 with practical adjustment)
             let cwnd = self.cwnd.load(Ordering::SeqCst);
             let new_ssthresh = (cwnd / 2).max(SSTHRESH_MIN);
             self.ssthresh.store(new_ssthresh, Ordering::SeqCst);
-            // RFC 4960 suggests 1*MTU, but use 2*MTU for better recovery
-            // This allows sending 2 chunks per RTT, reducing the risk of stalling
-            // while still being conservative compared to the pre-timeout window
+
             let new_cwnd = MAX_SCTP_PACKET_SIZE * 2;
             self.cwnd.store(new_cwnd, Ordering::SeqCst);
             self.partial_bytes_acked.store(0, Ordering::SeqCst);
             self.fast_recovery_active.store(false, Ordering::SeqCst);
-            // Exit Fast Recovery on timeout
+
             self.fast_recovery_exit_tsn.store(0, Ordering::SeqCst);
             debug!(
                 "Congestion Control: RTO timeout, cwnd {} -> {}, ssthresh {}",
                 cwnd, new_cwnd, new_ssthresh
             );
 
-            // CRITICAL: Add retransmit_size to flight_size AFTER setting cwnd
-            // This ensures flight_size reflects the actual in-flight data
             if retransmit_size > 0 {
                 self.flight_size
                     .fetch_add(retransmit_size, Ordering::SeqCst);
             }
 
-            // Retransmit expired chunks
             let chunks: Vec<Bytes> = to_retransmit.into_iter().map(|(_, p)| p).collect();
             if let Err(e) = self.transmit_chunks(chunks).await {
                 warn!("Failed to retransmit chunks: {}", e);
             }
         }
 
-        // After a timeout or SACK, try to drain any chunks that were marked for retransmission
-        // but couldn't fit in the initial timeout MTU.
         self.drain_retransmissions().await?;
 
         Ok(())
@@ -966,16 +985,13 @@ impl SctpInner {
                 }
             }
 
-            // Atomically add total size to flight_size
             if total_size > 0 {
                 let new_flight = current_flight + total_size;
                 if new_flight > effective_window {
-                    // Shouldn't happen with our logic, but guard against it
-                    warn!(
+                    debug!(
                         "drain_retransmissions: would exceed window (flight={} + {} > {}), skipping",
                         current_flight, total_size, effective_window
                     );
-                    // Roll back in_flight flags
                     for record in sent_queue.values_mut() {
                         if record.in_flight && record.sent_time == now {
                             record.in_flight = false;
@@ -1071,9 +1087,7 @@ impl SctpInner {
             src_port, dst_port, verification_tag
         );
 
-        // Verify checksum
         {
-            // We need the original packet bytes but with checksum field zeroed.
             let mut packet_copy = packet.to_vec();
             if packet_copy.len() >= 12 {
                 packet_copy[8] = 0;
@@ -1355,8 +1369,6 @@ impl SctpInner {
             if outcome.bytes_acked_by_cum_tsn > 0 || !outcome.rtt_samples.is_empty() {
                 self.association_error_count.store(0, Ordering::SeqCst);
 
-                // If we successfully received ACKs and ssthresh is at minimum, gradually increase it
-                // This helps recover faster in lossy networks
                 let ssthresh = self.ssthresh.load(Ordering::SeqCst);
                 if ssthresh == SSTHRESH_MIN && outcome.bytes_acked_by_cum_tsn > 0 {
                     let cwnd = self.cwnd.load(Ordering::SeqCst);
@@ -1753,10 +1765,12 @@ impl SctpInner {
                     if error_count >= self.max_association_retransmits
                         && self.max_association_retransmits > 0
                     {
+                        let rto_state = self.rto_state.lock().unwrap();
                         warn!(
-                            "SCTP Association heartbeat timeout limit reached ({}), closing",
-                            self.max_association_retransmits
+                            "SCTP Association heartbeat timeout limit reached ({}/{}), RTO={:.1}s, closing connection",
+                            error_count, self.max_association_retransmits, rto_state.rto
                         );
+                        drop(rto_state);
                         self.set_state(SctpState::Closed);
                         return Ok(());
                     }
