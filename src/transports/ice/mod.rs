@@ -10,7 +10,7 @@ use bytes::Bytes;
 use futures::future::BoxFuture;
 use futures::stream::{FuturesUnordered, StreamExt};
 use std::collections::HashMap;
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -18,7 +18,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use tokio::net::{UdpSocket, lookup_host};
 use tokio::sync::{Mutex, broadcast, mpsc, oneshot, watch};
 use tokio::time::timeout;
-use tracing::{debug, instrument, trace, warn};
+use tracing::{debug, info, instrument, trace, warn};
 
 #[cfg(any(test, feature = "simulator"))]
 use self::stun::random_u32;
@@ -28,6 +28,8 @@ use self::stun::{
 use crate::{IceServer, IceTransportPolicy, RtcConfiguration};
 
 pub(crate) const MAX_STUN_MESSAGE: usize = 1500;
+const CHECK_RETRY_BASE: Duration = Duration::from_millis(500);
+const CHECK_RETRY_MAX: Duration = Duration::from_secs(5);
 
 #[cfg(any(test, feature = "simulator"))]
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -87,6 +89,9 @@ struct IceTransportInner {
     gatherer: IceGatherer,
     local_parameters: std::sync::Mutex<IceParameters>,
     remote_parameters: std::sync::Mutex<Option<IceParameters>>,
+    remote_tie_breaker: std::sync::Mutex<Option<u64>>,
+    ice_start: std::sync::Mutex<Option<Instant>>,
+    check_retry_delay: std::sync::Mutex<Duration>,
     pending_transactions: std::sync::Mutex<HashMap<[u8; 12], oneshot::Sender<StunDecoded>>>,
     data_receiver: std::sync::Mutex<Option<Arc<dyn PacketReceiver>>>,
     buffered_packets: std::sync::Mutex<Vec<(Vec<u8>, SocketAddr)>>,
@@ -113,6 +118,7 @@ impl std::fmt::Debug for IceTransportInner {
             .field("gatherer", &self.gatherer)
             .field("local_parameters", &self.local_parameters)
             .field("remote_parameters", &self.remote_parameters)
+            .field("remote_tie_breaker", &self.remote_tie_breaker)
             .field("pending_transactions", &self.pending_transactions)
             .field("data_receiver", &"PacketReceiver")
             .field("buffered_packets", &self.buffered_packets)
@@ -129,6 +135,7 @@ struct IceTransportRunner {
     socket_rx: mpsc::UnboundedReceiver<IceSocketWrapper>,
     candidate_rx: broadcast::Receiver<IceCandidate>,
     cmd_rx: mpsc::UnboundedReceiver<IceCommand>,
+    state_rx: watch::Receiver<IceTransportState>,
 }
 
 impl IceTransportRunner {
@@ -142,6 +149,14 @@ impl IceTransportRunner {
 
         loop {
             tokio::select! {
+                res = self.state_rx.changed() => {
+                    if res.is_err() {
+                        break;
+                    }
+                    if *self.state_rx.borrow() == IceTransportState::Closed {
+                        break;
+                    }
+                }
                 Some(socket) = self.socket_rx.recv() => {
                     match socket {
                         IceSocketWrapper::Udp(s) => {
@@ -307,6 +322,18 @@ impl IceTransportRunner {
                         msg.attributes.push(StunAttribute::Username(username));
                         msg.attributes
                             .push(StunAttribute::Priority(pair.local.priority));
+                        let role = *inner.role.lock().unwrap();
+                        let tie_breaker = inner.local_parameters.lock().unwrap().tie_breaker;
+                        match role {
+                            IceRole::Controlling => {
+                                msg.attributes
+                                    .push(StunAttribute::IceControlling(tie_breaker));
+                            }
+                            IceRole::Controlled => {
+                                msg.attributes
+                                    .push(StunAttribute::IceControlled(tie_breaker));
+                            }
+                        }
 
                         if let Ok(bytes) = msg.encode(Some(params.password.as_bytes()), true) {
                             // Register transaction to avoid "Unmatched transaction" logs
@@ -344,6 +371,7 @@ impl IceTransport {
         let (socket_tx, socket_rx) = tokio::sync::mpsc::unbounded_channel();
         let gatherer = IceGatherer::new(config.clone(), candidate_tx.clone(), socket_tx);
         let (state_tx, state_rx) = watch::channel(IceTransportState::New);
+        let runner_state_rx = state_tx.subscribe();
         let (gathering_state_tx, _) = watch::channel(IceGathererState::New);
         let (selected_socket_tx, selected_socket_rx) = watch::channel(None);
         let (selected_pair_tx, selected_pair_rx) = watch::channel(None);
@@ -362,6 +390,9 @@ impl IceTransport {
             gatherer,
             local_parameters: std::sync::Mutex::new(IceParameters::generate()),
             remote_parameters: std::sync::Mutex::new(None),
+            remote_tie_breaker: std::sync::Mutex::new(None),
+            ice_start: std::sync::Mutex::new(None),
+            check_retry_delay: std::sync::Mutex::new(CHECK_RETRY_BASE),
             pending_transactions: std::sync::Mutex::new(HashMap::new()),
             data_receiver: std::sync::Mutex::new(None),
             buffered_packets: std::sync::Mutex::new(Vec::new()),
@@ -381,6 +412,7 @@ impl IceTransport {
             socket_rx,
             candidate_rx: candidate_tx.subscribe(),
             cmd_rx,
+            state_rx: runner_state_rx,
         };
 
         (Self { inner }, runner.run())
@@ -452,11 +484,19 @@ impl IceTransport {
         self.start_gathering()?;
         self.start_keepalive();
         {
+            let mut start = self.inner.ice_start.lock().unwrap();
+            *start = Some(Instant::now());
+        }
+        {
             let mut params = self.inner.remote_parameters.lock().unwrap();
             *params = Some(remote);
         }
         if let Err(e) = self.inner.state.send(IceTransportState::Checking) {
             warn!("start: failed to set state to Checking: {}", e);
+        }
+        {
+            let mut delay = self.inner.check_retry_delay.lock().unwrap();
+            *delay = CHECK_RETRY_BASE;
         }
         self.try_connectivity_checks();
         Ok(())
@@ -537,6 +577,11 @@ impl IceTransport {
 
     pub fn stop(&self) {
         let _ = self.inner.state.send(IceTransportState::Closed);
+        let _ = self.inner.selected_socket.send(None);
+        let _ = self.inner.selected_pair_notifier.send(None);
+        *self.inner.selected_pair.lock().unwrap() = None;
+        self.inner.gatherer.sockets.lock().unwrap().clear();
+        self.inner.gatherer.turn_clients.lock().unwrap().clear();
     }
 
     pub fn set_role(&self, role: IceRole) {
@@ -544,6 +589,10 @@ impl IceTransport {
     }
 
     pub fn add_remote_candidate(&self, candidate: IceCandidate) {
+        {
+            let mut delay = self.inner.check_retry_delay.lock().unwrap();
+            *delay = CHECK_RETRY_BASE;
+        }
         let mut list = self.inner.remote_candidates.lock().unwrap();
         list.push(candidate);
         drop(list);
@@ -666,8 +715,28 @@ async fn perform_connectivity_checks_async(inner: Arc<IceTransportInner>) {
         return;
     }
     let locals = inner.gatherer.local_candidates();
-    let remotes = inner.remote_candidates.lock().unwrap().clone();
+    let mut remotes = inner.remote_candidates.lock().unwrap().clone();
     let role = *inner.role.lock().unwrap();
+    let filter_private = inner.config.filter_private_host_candidates;
+
+    if filter_private {
+        let local_mask = local_private_range_mask(&locals);
+        let has_non_private_remote = remotes
+            .iter()
+            .any(|remote| private_host_candidate_mask(remote).is_none());
+        if has_non_private_remote {
+            let mut filtered = Vec::with_capacity(remotes.len());
+            for remote in remotes.into_iter() {
+                if let Some(mask) = private_host_candidate_mask(&remote) {
+                    if local_mask & mask == 0 {
+                        continue;
+                    }
+                }
+                filtered.push(remote);
+            }
+            remotes = filtered;
+        }
+    }
 
     if locals.is_empty() || remotes.is_empty() {
         return;
@@ -752,6 +821,10 @@ async fn perform_connectivity_checks_async(inner: Arc<IceTransportInner>) {
             }
             let _ = inner.state.send(IceTransportState::Connected);
             success = true;
+            {
+                let mut delay = inner.check_retry_delay.lock().unwrap();
+                *delay = CHECK_RETRY_BASE;
+            }
             debug!(
                 "ICE checks complete. Selected pair: {} -> {}",
                 pair.local.address, pair.remote.address
@@ -788,7 +861,37 @@ async fn perform_connectivity_checks_async(inner: Arc<IceTransportInner>) {
         let has_selected_pair = inner.selected_pair.lock().unwrap().is_some();
         // Only set Failed if we're not already connected AND we don't have a working pair
         if state != IceTransportState::Connected && !has_selected_pair {
-            let _ = inner.state.send(IceTransportState::Failed);
+            let elapsed = inner
+                .ice_start
+                .lock()
+                .unwrap()
+                .map(|t| t.elapsed())
+                .unwrap_or(Duration::ZERO);
+            let timeout = inner.config.ice_connection_timeout;
+            if elapsed >= timeout {
+                let _ = inner.state.send(IceTransportState::Failed);
+            } else {
+                let remaining = timeout.checked_sub(elapsed).unwrap_or(Duration::ZERO);
+                let retry_delay = {
+                    let mut delay = inner.check_retry_delay.lock().unwrap();
+                    let retry_delay = *delay;
+                    let doubled = retry_delay + retry_delay;
+                    *delay = if retry_delay >= CHECK_RETRY_MAX {
+                        CHECK_RETRY_MAX
+                    } else if doubled > CHECK_RETRY_MAX {
+                        CHECK_RETRY_MAX
+                    } else {
+                        doubled
+                    };
+                    retry_delay
+                };
+                let retry_delay = std::cmp::min(retry_delay, remaining);
+                let inner_clone = inner.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(retry_delay).await;
+                    let _ = inner_clone.cmd_tx.send(IceCommand::RunChecks);
+                });
+            }
         }
     }
 }
@@ -809,6 +912,43 @@ fn resolve_socket(inner: &IceTransportInner, pair: &IceCandidatePair) -> Option<
         }
         socket.map(IceSocketWrapper::Udp)
     }
+}
+
+const PRIVATE_RANGE_10: u8 = 1 << 0;
+const PRIVATE_RANGE_172: u8 = 1 << 1;
+const PRIVATE_RANGE_192: u8 = 1 << 2;
+
+fn private_ipv4_range_mask(ip: Ipv4Addr) -> Option<u8> {
+    let octets = ip.octets();
+    if octets[0] == 10 {
+        Some(PRIVATE_RANGE_10)
+    } else if octets[0] == 172 && (16..=31).contains(&octets[1]) {
+        Some(PRIVATE_RANGE_172)
+    } else if octets[0] == 192 && octets[1] == 168 {
+        Some(PRIVATE_RANGE_192)
+    } else {
+        None
+    }
+}
+
+fn private_host_candidate_mask(candidate: &IceCandidate) -> Option<u8> {
+    if candidate.typ != IceCandidateType::Host {
+        return None;
+    }
+    let IpAddr::V4(ip) = candidate.address.ip() else {
+        return None;
+    };
+    private_ipv4_range_mask(ip)
+}
+
+fn local_private_range_mask(locals: &[IceCandidate]) -> u8 {
+    let mut mask = 0u8;
+    for local in locals {
+        if let Some(bit) = private_host_candidate_mask(local) {
+            mask |= bit;
+        }
+    }
+    mask
 }
 
 async fn handle_packet(
@@ -874,19 +1014,35 @@ async fn handle_packet(
                     }
                 } else if msg.class == StunClass::ErrorResponse {
                     trace!("Received STUN Error Response from {}", addr);
-                    warn!(
-                        "Received STUN Error Response from {}: {:?}",
-                        addr, msg.error_code
-                    );
-                    if let Some(code) = msg.error_code {
-                        if code == 401 {
+                    match msg.error_code {
+                        Some(487) => {
+                            handle_role_conflict(&inner, &msg, addr).await;
+                        }
+                        Some(401) => {
+                            warn!(
+                                "Received STUN Error Response from {}: {:?}",
+                                addr, msg.error_code
+                            );
                             let remote_params = inner.remote_parameters.lock().unwrap().clone();
                             warn!(
                                 "STUN 401 received. Current remote params: {:?}",
                                 remote_params
                             );
+                            trace!("Error code: 401");
                         }
-                        trace!("Error code: {}", code);
+                        Some(code) => {
+                            warn!(
+                                "Received STUN Error Response from {}: {:?}",
+                                addr, msg.error_code
+                            );
+                            trace!("Error code: {}", code);
+                        }
+                        None => {
+                            warn!(
+                                "Received STUN Error Response from {}: {:?}",
+                                addr, msg.error_code
+                            );
+                        }
                     }
                 }
             }
@@ -916,6 +1072,10 @@ async fn handle_stun_request(
     addr: SocketAddr,
     inner: Arc<IceTransportInner>,
 ) {
+    if let Some(remote_tie) = msg.ice_controlling.or(msg.ice_controlled) {
+        *inner.remote_tie_breaker.lock().unwrap() = Some(remote_tie);
+    }
+
     let response = StunMessage::binding_success_response(msg.transaction_id, addr);
 
     let password = inner.local_parameters.lock().unwrap().password.clone();
@@ -1020,6 +1180,61 @@ async fn handle_stun_request(
             }
         }
     }
+}
+
+async fn handle_role_conflict(inner: &Arc<IceTransportInner>, msg: &StunDecoded, addr: SocketAddr) {
+    let remote_tie = msg
+        .ice_controlling
+        .or(msg.ice_controlled)
+        .or_else(|| *inner.remote_tie_breaker.lock().unwrap());
+
+    let Some(remote_tie) = remote_tie else {
+        debug!(
+            "ICE role conflict (487) from {} without remote tie-breaker",
+            addr
+        );
+        return;
+    };
+
+    let local_tie = inner.local_parameters.lock().unwrap().tie_breaker;
+    if local_tie == remote_tie {
+        warn!(
+            "ICE role conflict (487) from {} with equal tie-breakers {}",
+            addr, local_tie
+        );
+        return;
+    }
+
+    let desired_role = if local_tie > remote_tie {
+        IceRole::Controlling
+    } else {
+        IceRole::Controlled
+    };
+
+    let previous = {
+        let mut role = inner.role.lock().unwrap();
+        if *role == desired_role {
+            debug!(
+                "ICE role conflict (487) from {} resolved: local={} remote={} role={:?}",
+                addr, local_tie, remote_tie, desired_role
+            );
+            return;
+        }
+        let previous = *role;
+        *role = desired_role;
+        previous
+    };
+
+    {
+        let mut checking = inner.checking_pairs.lock().await;
+        checking.clear();
+    }
+
+    let _ = inner.cmd_tx.send(IceCommand::RunChecks);
+    info!(
+        "ICE role conflict (487) from {}: local={} remote={} role {:?} -> {:?}",
+        addr, local_tie, remote_tie, previous, desired_role
+    );
 }
 
 struct TransactionGuard<'a> {

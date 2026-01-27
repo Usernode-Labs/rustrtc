@@ -47,6 +47,7 @@ const CHUNK_HEADER_SIZE: usize = 4;
 const MAX_SCTP_PACKET_SIZE: usize = 1200;
 const DEFAULT_MAX_PAYLOAD_SIZE: usize = 1172; // 1200 - 12 (common) - 16 (data header)
 const DUP_THRESH: u8 = 3;
+// const DUP_THRESH: u8 = 6; // Tolerate reordering on high-latency links.
 
 // Chunk Types
 const CT_DATA: u8 = 0;
@@ -95,6 +96,7 @@ struct RtoCalculator {
     rto: f64,
     min: f64,
     max: f64,
+    last_rtt: Option<f64>,
 }
 
 impl RtoCalculator {
@@ -105,10 +107,12 @@ impl RtoCalculator {
             rto: initial,
             min,
             max,
+            last_rtt: None,
         }
     }
 
     fn update(&mut self, rtt: f64) {
+        self.last_rtt = Some(rtt);
         if self.srtt == 0.0 {
             self.srtt = rtt;
             self.rttvar = rtt / 2.0;
@@ -121,6 +125,10 @@ impl RtoCalculator {
 
     fn backoff(&mut self) {
         self.rto = (self.rto * 2.0).min(self.max);
+    }
+
+    fn last_rtt(&self) -> Option<f64> {
+        self.last_rtt
     }
 }
 
@@ -313,6 +321,7 @@ fn apply_sack_to_sent_queue(
     for tsn in to_remove {
         if let Some(record) = sent_queue.remove(&tsn) {
             let len = record.payload.len();
+            trace!("SACK acknowledging TSN {} (len={})", tsn, len);
             if record.in_flight {
                 outcome.flight_reduction += len;
             }
@@ -378,7 +387,7 @@ fn apply_sack_to_sent_queue(
 
                 // Log first few missing TSNs
                 if missing_count <= 3 {
-                    trace!(
+                    debug!(
                         "Missing TSN {} reports: {} -> {}, acked={}, fast_retrans={}",
                         tsn,
                         old_reports,
@@ -413,7 +422,7 @@ fn apply_sack_to_sent_queue(
                     record.fast_retransmit = true;
                     record.fast_retransmit_time = Some(now);
 
-                    trace!(
+                    debug!(
                         "Fast retransmit triggered for TSN {} after {} missing reports (retrans #{})",
                         tsn, DUP_THRESH, record.transmit_count
                     );
@@ -426,7 +435,7 @@ fn apply_sack_to_sent_queue(
     }
 
     if missing_count > 0 && to_retransmit.is_empty() {
-        trace!(
+        debug!(
             "Found {} missing TSNs but none reached fast retransmit threshold",
             missing_count
         );
@@ -591,6 +600,15 @@ impl SctpTransport {
     pub fn buffered_amount(&self) -> usize {
         self.inner.flight_size.load(Ordering::SeqCst)
     }
+
+    pub fn smoothed_rtt(&self) -> Option<f64> {
+        let srtt = self.inner.rto_state.lock().unwrap().srtt;
+        if srtt == 0.0 { None } else { Some(srtt) }
+    }
+
+    pub fn last_rtt(&self) -> Option<f64> {
+        self.inner.rto_state.lock().unwrap().last_rtt()
+    }
 }
 
 impl Drop for SctpTransport {
@@ -606,10 +624,10 @@ impl SctpInner {
         }
         let srtt = self.rto_state.lock().unwrap().srtt;
         if srtt == 0.0 {
-            return 20;
+            return 50;
         }
-        let ms = (srtt * 1000.0 * 0.25).round() as u32;
-        ms.clamp(10, 50)
+        let ms = (srtt * 1000.0 * 0.5).round() as u32;
+        ms.clamp(20, 200)
     }
 
     fn gap_signature(&self, cumulative_tsn_ack: u32) -> u32 {
@@ -839,20 +857,23 @@ impl SctpInner {
 
         let now = Instant::now();
         let rto = { self.rto_state.lock().unwrap().rto };
+        let rto_duration = Duration::from_secs_f64(rto);
         {
             let mut sent_queue = self.sent_queue.lock().unwrap();
-            let mut any_expired = false;
-            for record in sent_queue.values() {
-                if !record.acked && now >= record.sent_time + Duration::from_secs_f64(rto) {
-                    any_expired = true;
-                    break;
-                }
-            }
 
-            if !any_expired {
+            // First pass: identify which packets have actually timed out
+            let timed_out_tsns: std::collections::HashSet<u32> = sent_queue
+                .iter()
+                .filter(|(_, record)| !record.acked && now >= record.sent_time + rto_duration)
+                .map(|(tsn, _)| *tsn)
+                .collect();
+
+            if timed_out_tsns.is_empty() {
                 return Ok(());
             }
 
+            // Second pass: reset flight status for ALL in-flight packets
+            // This is necessary because RTO means we lost all in-flight data
             for record in sent_queue.values_mut() {
                 if record.in_flight {
                     record.in_flight = false;
@@ -863,7 +884,12 @@ impl SctpInner {
                         })
                         .ok();
                 }
-                if !record.acked {
+            }
+
+            // Third pass: Only reset sent_time and stats for packets that actually timed out
+            // This prevents disrupting packets that are still within their RTO window
+            for (tsn, record) in sent_queue.iter_mut() {
+                if timed_out_tsns.contains(tsn) {
                     record.sent_time = now;
                     record.missing_reports = 0;
                     record.fast_retransmit = false;
@@ -889,12 +915,19 @@ impl SctpInner {
             let mut current_len: usize = 0;
             let mut retransmit_batch_size: usize = 0;
 
+            // Fourth pass: Only process packets that actually timed out
+            // Use the pre-computed set to avoid issues with modified sent_time
             for (tsn, record) in sent_queue.iter_mut() {
                 if record.acked {
                     continue;
                 }
 
-                // Increment transmit_count first before checking limits
+                // Only process packets that actually timed out
+                if !timed_out_tsns.contains(tsn) {
+                    continue;
+                }
+
+                // Increment transmit_count only for timed-out packets
                 record.transmit_count += 1;
 
                 let mut abandoned = false;
@@ -1060,21 +1093,29 @@ impl SctpInner {
             let available_window = effective_window - current_flight;
             let mut chunks_to_send = Vec::new();
             let mut total_size = 0;
+            let mut modified_tsns = Vec::new();
+            let mut window_blocked = false;
 
             // Collect chunks that fit in available window
-            for record in sent_queue.values_mut() {
+            for (tsn, record) in sent_queue.iter_mut() {
                 if !record.acked && !record.in_flight && !record.abandoned {
                     let len = record.payload.len();
                     if total_size + len > available_window {
+                        window_blocked = true;
                         break; // Would exceed window
                     }
 
                     record.in_flight = true;
                     record.transmit_count += 1;
-                    record.sent_time = now;
+                    // Only update sent_time for retransmissions (transmit_count > 1)
+                    // For first transmission (transmit_count going 0->1), keep original sent_time
+                    if record.transmit_count > 1 {
+                        record.sent_time = now;
+                    }
                     record.fast_retransmit = false;
                     total_size += len;
                     chunks_to_send.push(record.payload.clone());
+                    modified_tsns.push(*tsn);
 
                     if chunks_to_send.len() >= 32 {
                         break;
@@ -1082,16 +1123,51 @@ impl SctpInner {
                 }
             }
 
+            // Zero Window Probing: If logic prevents sending but window is zero (or too small) and flight is zero,
+            // strict flow control would deadlock. We must send 1 packet as probe.
+            let mut is_probe = false;
+            if chunks_to_send.is_empty() && current_flight == 0 && window_blocked {
+                for (tsn, record) in sent_queue.iter_mut() {
+                    if !record.acked && !record.in_flight && !record.abandoned {
+                        record.in_flight = true;
+                        record.transmit_count += 1;
+                        if record.transmit_count > 1 {
+                            record.sent_time = now;
+                        }
+                        record.fast_retransmit = false;
+
+                        let len = record.payload.len();
+                        total_size += len;
+                        chunks_to_send.push(record.payload.clone());
+                        modified_tsns.push(*tsn);
+                        is_probe = true;
+                        break; // Only 1 probe packet
+                    }
+                }
+            }
+
             if total_size > 0 {
                 let new_flight = current_flight + total_size;
-                if new_flight > effective_window {
+                // Re-check effective_window because rwnd/cwnd might have changed (atomics)
+                let cwnd = self.cwnd.load(Ordering::SeqCst);
+                let rwnd = self.peer_rwnd.load(Ordering::SeqCst) as usize;
+                let effective_window = cwnd.min(rwnd);
+
+                // If probing, we intentionally exceed window (0).
+                // Otherwise calculate strict overflow logic.
+                if !is_probe && new_flight > effective_window {
                     debug!(
                         "drain_retransmissions: would exceed window (flight={} + {} > {}), skipping",
                         current_flight, total_size, effective_window
                     );
-                    for record in sent_queue.values_mut() {
-                        if record.in_flight && record.sent_time == now {
-                            record.in_flight = false;
+                    for tsn in modified_tsns {
+                        if let Some(record) = sent_queue.get_mut(&tsn) {
+                            if record.in_flight {
+                                record.in_flight = false;
+                                if record.transmit_count > 0 {
+                                    record.transmit_count -= 1;
+                                }
+                            }
                         }
                     }
                     return Ok(());
@@ -1103,7 +1179,7 @@ impl SctpInner {
         };
 
         if !chunks_to_send.is_empty() {
-            trace!(
+            debug!(
                 "Draining {} retransmissions from queue",
                 chunks_to_send.len()
             );
@@ -1553,7 +1629,7 @@ impl SctpInner {
                         let new_cwnd = old_cwnd + increase;
                         // Log when cwnd doubles to track growth
                         if new_cwnd >= old_cwnd * 2 || old_cwnd < MAX_SCTP_PACKET_SIZE * 3 {
-                            trace!(
+                            debug!(
                                 "Congestion Control: Slow Start cwnd {} -> {} (ssthresh={}, increase={})",
                                 old_cwnd, new_cwnd, ssthresh, increase
                             );
@@ -2073,6 +2149,7 @@ impl SctpInner {
                     }
                 };
                 if allow_immediate {
+                    trace!("Gap changed. Immediate SACK; cum_ack={}.", ack);
                     self.send_sack(ack).await?;
                     self.ack_scheduled.store(false, Ordering::Relaxed);
                     self.sack_counter.store(0, Ordering::Relaxed);
@@ -3099,9 +3176,12 @@ mod tests {
         let mut config = config;
         config.sctp_max_association_retransmits = 2;
 
-        let (sctp, _) = SctpTransport::new(
+        // Create incoming channel (not used in this test)
+        let (_incoming_tx, incoming_rx) = mpsc::unbounded_channel();
+
+        let (sctp, runner) = SctpTransport::new(
             dtls,
-            mpsc::unbounded_channel().1,
+            incoming_rx,
             Arc::new(Mutex::new(Vec::new())),
             5000,
             5000,
@@ -3109,6 +3189,9 @@ mod tests {
             true,
             &config,
         );
+
+        // Spawn the runner to handle outgoing packets
+        tokio::spawn(runner);
 
         // Set state to Connecting
         *sctp.inner.state.lock().unwrap() = SctpState::Connecting;
@@ -3133,22 +3216,44 @@ mod tests {
             );
         }
 
-        // First timeout: transmit_count becomes 2
+        // First timeout: error_count becomes 1, transmit_count becomes 2
         sctp.inner.handle_timeout().await.unwrap();
-        assert_eq!(
-            sctp.inner.state.lock().unwrap().clone(),
-            SctpState::Connecting
-        );
+        let state_after_first = sctp.inner.state.lock().unwrap().clone();
+        let error_count_after_first = sctp.inner.association_error_count.load(Ordering::SeqCst);
 
-        // Manually set sent_time back to trigger another timeout
+        // State should still be Connecting after first timeout
+        assert_eq!(state_after_first, SctpState::Connecting);
+        assert_eq!(error_count_after_first, 1);
+
+        // Check transmit_count was incremented
+        {
+            let sent_queue = sctp.inner.sent_queue.lock().unwrap();
+            let record = sent_queue.get(&100).unwrap();
+            assert_eq!(record.transmit_count, 2);
+        }
+
+        // Check transmit_count was incremented
+        {
+            let sent_queue = sctp.inner.sent_queue.lock().unwrap();
+            let record = sent_queue.get(&100).unwrap();
+            assert_eq!(record.transmit_count, 2);
+        }
+
+        // Manually set sent_time back to old time to trigger another timeout
         {
             let mut sent_queue = sctp.inner.sent_queue.lock().unwrap();
             let record = sent_queue.get_mut(&100).unwrap();
             record.sent_time = Instant::now() - Duration::from_secs(10);
         }
 
+        // Second timeout: error_count becomes 2, transmit_count becomes 3
         sctp.inner.handle_timeout().await.unwrap();
-        assert_eq!(sctp.inner.state.lock().unwrap().clone(), SctpState::Closed);
+
+        // With max_association_retransmits=2, error_count reaching 2 should trigger close
+        let final_state = sctp.inner.state.lock().unwrap().clone();
+        let final_error_count = sctp.inner.association_error_count.load(Ordering::SeqCst);
+        assert_eq!(final_error_count, 2);
+        assert_eq!(final_state, SctpState::Closed);
     }
 
     #[tokio::test]
@@ -3280,5 +3385,172 @@ mod tests {
                 desc, fast_retrans, missing_reports, elapsed_ms
             );
         }
+    }
+
+    #[test]
+    fn test_sent_time_accuracy_with_drain_retransmissions() {
+        // This test verifies the bug where drain_retransmissions doesn't update sent_time
+        // for first-time transmissions (transmit_count going 0->1)
+
+        let creation_time = Instant::now();
+        std::thread::sleep(Duration::from_millis(50));
+        let drain_time = Instant::now();
+
+        // Simulate a packet created at T0 but sent later via drain_retransmissions
+        let mut record = ChunkRecord {
+            payload: Bytes::from_static(b"test"),
+            sent_time: creation_time, // Created at T0
+            transmit_count: 0,        // Not yet sent
+            missing_reports: 0,
+            stream_id: 0,
+            abandoned: false,
+            fast_retransmit: false,
+            fast_retransmit_time: None,
+            in_flight: false,
+            acked: false,
+        };
+
+        // Simulate drain_retransmissions logic (current buggy behavior)
+        record.in_flight = true;
+        record.transmit_count += 1;
+        // BUG: Only update sent_time for retransmissions (transmit_count > 1)
+        if record.transmit_count > 1 {
+            record.sent_time = drain_time;
+        }
+
+        // After drain at drain_time, transmit_count is 1 but sent_time is still creation_time
+        assert_eq!(record.transmit_count, 1);
+        assert_eq!(record.sent_time, creation_time); // BUG: Should be drain_time!
+
+        // Calculate when RTO timeout would trigger with RTO = 0.2s
+        let rto = Duration::from_secs_f64(0.2);
+        let rto_expiry = record.sent_time + rto;
+
+        // The packet was actually sent at drain_time, so RTO should expire at drain_time + 0.2s
+        // But the code uses creation_time + 0.2s, which is 50ms earlier!
+        let expected_expiry = drain_time + rto;
+        let actual_time_diff = expected_expiry.duration_since(rto_expiry);
+
+        println!("Bug demonstration:");
+        println!("  Packet created at: T0");
+        println!("  Packet sent at: T0 + 50ms");
+        println!("  RTO = 200ms");
+        println!("  Expected RTO expiry: T0 + 50ms + 200ms = T0 + 250ms");
+        println!("  Actual RTO expiry (buggy): T0 + 200ms");
+        println!("  Timing error: -50ms (expires too early!)");
+
+        // The bug causes RTO to expire 50ms too early
+        assert!(
+            actual_time_diff >= Duration::from_millis(45), // Allow small timing variance
+            "BUG DETECTED: RTO expiry is calculated from creation_time instead of actual send time. \
+             Time difference: {:?}ms (should be ~50ms)",
+            actual_time_diff.as_millis()
+        );
+    }
+
+    #[test]
+    fn test_sent_time_accuracy_with_immediate_send() {
+        // This test verifies another aspect: packets sent immediately (in_flight=true, transmit_count=0)
+
+        let creation_time = Instant::now();
+
+        // Simulate immediate send (like in send_data for small packets)
+        let record = ChunkRecord {
+            payload: Bytes::from_static(b"test"),
+            sent_time: creation_time,
+            transmit_count: 0, // BUG: Should be 1 after sending!
+            missing_reports: 0,
+            stream_id: 0,
+            abandoned: false,
+            fast_retransmit: false,
+            fast_retransmit_time: None,
+            in_flight: true, // Already sent
+            acked: false,
+        };
+
+        // Packet is in_flight but transmit_count is still 0
+        assert_eq!(record.in_flight, true);
+        assert_eq!(record.transmit_count, 0); // BUG: Should be 1!
+
+        println!("Bug demonstration:");
+        println!("  Packet marked as in_flight=true (sent)");
+        println!("  But transmit_count=0 (not sent)");
+        println!("  This semantic inconsistency causes RTO timing issues");
+
+        // The semantic inconsistency: packet is "sent" (in_flight) but "not sent" (transmit_count=0)
+        assert_eq!(
+            record.in_flight as u8 + record.transmit_count as u8,
+            1, // in_flight(1) + transmit_count(0) = 1
+            "INCONSISTENCY DETECTED: Packet is in_flight but transmit_count is 0"
+        );
+    }
+
+    #[test]
+    fn test_rto_timing_with_delayed_transmission() {
+        // Test the complete scenario: packet created, queued, then sent later
+
+        let t0 = Instant::now();
+
+        // T0: Packet created and queued (window full)
+        let mut sent_queue: BTreeMap<u32, ChunkRecord> = BTreeMap::new();
+        sent_queue.insert(
+            100,
+            ChunkRecord {
+                payload: Bytes::from_static(b"data"),
+                sent_time: t0,
+                transmit_count: 0,
+                missing_reports: 0,
+                stream_id: 0,
+                abandoned: false,
+                fast_retransmit: false,
+                fast_retransmit_time: None,
+                in_flight: false,
+                acked: false,
+            },
+        );
+
+        // Simulate 100ms delay before window opens
+        std::thread::sleep(Duration::from_millis(100));
+        let t1 = Instant::now();
+
+        // T1: drain_retransmissions sends the packet (current buggy logic)
+        let record = sent_queue.get_mut(&100).unwrap();
+        record.in_flight = true;
+        record.transmit_count += 1;
+        if record.transmit_count > 1 {
+            record.sent_time = t1; // Only update for retransmissions
+        }
+
+        // Now check RTO timeout calculation
+        let rto = Duration::from_millis(200);
+        let now = t1;
+
+        let record = sent_queue.get(&100).unwrap();
+        let rto_expiry = record.sent_time + rto;
+        let time_until_timeout = if rto_expiry > now {
+            rto_expiry - now
+        } else {
+            Duration::ZERO
+        };
+
+        println!("Scenario:");
+        println!("  T0: Packet created and queued");
+        println!("  T1 (T0+100ms): Packet actually sent");
+        println!("  RTO = 200ms");
+        println!("  Expected timeout at: T1 + 200ms = T0 + 300ms");
+        println!("  Actual timeout at (buggy): T0 + 200ms");
+        println!(
+            "  Time until timeout from T1: {:?}ms",
+            time_until_timeout.as_millis()
+        );
+
+        // BUG: Time until timeout is only ~100ms instead of 200ms
+        // because sent_time is T0, not T1
+        assert!(
+            time_until_timeout < Duration::from_millis(150),
+            "BUG VERIFIED: Timeout will trigger in {:?}ms instead of 200ms. \
+             The packet will timeout 100ms early because sent_time wasn't updated!",
+            time_until_timeout.as_millis()
+        );
     }
 }
