@@ -10,7 +10,7 @@ use bytes::Bytes;
 use futures::future::BoxFuture;
 use futures::stream::{FuturesUnordered, StreamExt};
 use std::collections::HashMap;
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -1027,8 +1027,12 @@ async fn perform_connectivity_checks_async(inner: Arc<IceTransportInner>) {
     }
 
     let locals = inner.gatherer.local_candidates();
-    let remotes = inner.remote_candidates.lock().unwrap().clone();
+    let mut remotes = inner.remote_candidates.lock().unwrap().clone();
     let role = *inner.role.lock().unwrap();
+
+    if inner.config.filter_private_host_candidates {
+        remotes = filter_remote_candidates_for_private_ranges(&locals, remotes);
+    }
 
     if locals.is_empty() || remotes.is_empty() {
         return;
@@ -1195,6 +1199,67 @@ fn resolve_socket(inner: &IceTransportInner, pair: &IceCandidatePair) -> Option<
         }
         socket.map(IceSocketWrapper::Udp)
     }
+}
+
+const PRIVATE_RANGE_10: u8 = 1 << 0;
+const PRIVATE_RANGE_172: u8 = 1 << 1;
+const PRIVATE_RANGE_192: u8 = 1 << 2;
+
+fn private_ipv4_range_mask(ip: Ipv4Addr) -> Option<u8> {
+    let octets = ip.octets();
+    if octets[0] == 10 {
+        Some(PRIVATE_RANGE_10)
+    } else if octets[0] == 172 && (16..=31).contains(&octets[1]) {
+        Some(PRIVATE_RANGE_172)
+    } else if octets[0] == 192 && octets[1] == 168 {
+        Some(PRIVATE_RANGE_192)
+    } else {
+        None
+    }
+}
+
+fn private_host_candidate_mask(candidate: &IceCandidate) -> Option<u8> {
+    if candidate.typ != IceCandidateType::Host {
+        return None;
+    }
+    let IpAddr::V4(ip) = candidate.address.ip() else {
+        return None;
+    };
+    private_ipv4_range_mask(ip)
+}
+
+fn local_private_range_mask(locals: &[IceCandidate]) -> u8 {
+    let mut mask = 0u8;
+    for local in locals {
+        if let Some(bit) = private_host_candidate_mask(local) {
+            mask |= bit;
+        }
+    }
+    mask
+}
+
+fn filter_remote_candidates_for_private_ranges(
+    locals: &[IceCandidate],
+    remotes: Vec<IceCandidate>,
+) -> Vec<IceCandidate> {
+    let local_mask = local_private_range_mask(locals);
+    let has_non_private_remote = remotes
+        .iter()
+        .any(|remote| private_host_candidate_mask(remote).is_none());
+    if !has_non_private_remote {
+        return remotes;
+    }
+
+    let mut filtered = Vec::with_capacity(remotes.len());
+    for remote in remotes {
+        if let Some(mask) = private_host_candidate_mask(&remote) {
+            if local_mask & mask == 0 {
+                continue;
+            }
+        }
+        filtered.push(remote);
+    }
+    filtered
 }
 
 async fn handle_packet(

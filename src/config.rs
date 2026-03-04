@@ -256,6 +256,10 @@ impl PartialEq for DepacketizerStrategy {
 
 impl Eq for DepacketizerStrategy {}
 
+fn default_filter_private_host_candidates() -> bool {
+    true
+}
+
 /// Primary configuration for a `PeerConnection`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RtcConfiguration {
@@ -270,6 +274,8 @@ pub struct RtcConfiguration {
     pub external_ip: Option<String>,
     pub bind_ip: Option<String>,
     pub disable_ipv6: bool,
+    #[serde(default = "default_filter_private_host_candidates")]
+    pub filter_private_host_candidates: bool,
     pub ssrc_start: u32,
     pub stun_timeout: std::time::Duration,
     /// Timeout for the ICE nomination binding check (USE-CANDIDATE).
@@ -309,6 +315,7 @@ impl Default for RtcConfiguration {
             external_ip: None,
             bind_ip: None,
             disable_ipv6: false,
+            filter_private_host_candidates: true,
             ssrc_start: 10000,
             stun_timeout: std::time::Duration::from_secs(5),
             nomination_timeout: std::time::Duration::from_secs(10),
@@ -356,6 +363,11 @@ impl RtcConfigurationBuilder {
 
     pub fn enable_ice_lite(mut self, enable: bool) -> Self {
         self.inner.enable_ice_lite = enable;
+        self
+    }
+
+    pub fn filter_private_host_candidates(mut self, enable: bool) -> Self {
+        self.inner.filter_private_host_candidates = enable;
         self
     }
 
