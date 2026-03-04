@@ -18,7 +18,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use tokio::net::{UdpSocket, lookup_host};
 use tokio::sync::{Mutex, broadcast, mpsc, oneshot, watch};
 use tokio::time::timeout;
-use tracing::{debug, instrument, trace};
+use tracing::{debug, instrument, trace, warn};
 
 #[cfg(any(test, feature = "simulator"))]
 use self::stun::random_u32;
@@ -87,6 +87,7 @@ struct IceTransportInner {
     gatherer: IceGatherer,
     local_parameters: std::sync::Mutex<IceParameters>,
     remote_parameters: std::sync::Mutex<Option<IceParameters>>,
+    remote_tie_breaker: std::sync::Mutex<Option<u64>>,
     pending_transactions: std::sync::Mutex<HashMap<[u8; 12], oneshot::Sender<StunDecoded>>>,
     data_receiver: std::sync::Mutex<Option<Arc<dyn PacketReceiver>>>,
     buffered_packets: std::sync::Mutex<Vec<(Vec<u8>, SocketAddr)>>,
@@ -118,6 +119,7 @@ impl std::fmt::Debug for IceTransportInner {
             .field("gatherer", &self.gatherer)
             .field("local_parameters", &self.local_parameters)
             .field("remote_parameters", &self.remote_parameters)
+            .field("remote_tie_breaker", &self.remote_tie_breaker)
             .field("pending_transactions", &self.pending_transactions)
             .field("data_receiver", &"PacketReceiver")
             .field("buffered_packets", &self.buffered_packets)
@@ -322,14 +324,23 @@ impl IceTransportRunner {
 
                     let remote_params = inner.remote_parameters.lock().unwrap().clone();
                     if let Some(params) = remote_params {
+                        let local_params = inner.local_parameters.lock().unwrap().clone();
+                        let role = *inner.role.lock().unwrap();
                         let username = format!(
                             "{}:{}",
                             params.username_fragment,
-                            inner.local_parameters.lock().unwrap().username_fragment
+                            local_params.username_fragment
                         );
                         msg.attributes.push(StunAttribute::Username(username));
-                        msg.attributes
-                            .push(StunAttribute::Priority(pair.local.priority));
+                        msg.attributes.push(StunAttribute::Priority(pair.local.priority));
+                        match role {
+                            IceRole::Controlling => msg
+                                .attributes
+                                .push(StunAttribute::IceControlling(local_params.tie_breaker)),
+                            IceRole::Controlled => msg
+                                .attributes
+                                .push(StunAttribute::IceControlled(local_params.tie_breaker)),
+                        }
 
                         if let Ok(bytes) = msg.encode(Some(params.password.as_bytes()), true) {
                             // Register transaction to avoid "Unmatched transaction" logs
@@ -550,6 +561,7 @@ impl IceTransport {
             gatherer,
             local_parameters: std::sync::Mutex::new(IceParameters::generate()),
             remote_parameters: std::sync::Mutex::new(None),
+            remote_tie_breaker: std::sync::Mutex::new(None),
             pending_transactions: std::sync::Mutex::new(HashMap::new()),
             data_receiver: std::sync::Mutex::new(None),
             buffered_packets: std::sync::Mutex::new(Vec::new()),
@@ -1324,20 +1336,26 @@ async fn handle_packet(
                         );
                     }
                 } else if msg.class == StunClass::ErrorResponse {
-                    trace!("Received STUN Error Response from {}", addr);
-                    debug!(
+                    trace!(
                         "Received STUN Error Response from {}: {:?}",
-                        addr, msg.error_code
+                        addr,
+                        msg.error_code
                     );
-                    if let Some(code) = msg.error_code {
-                        if code == 401 {
+                    match msg.error_code {
+                        Some(487) => {
+                            handle_role_conflict(&inner, &msg, addr).await;
+                        }
+                        Some(401) => {
                             let remote_params = inner.remote_parameters.lock().unwrap().clone();
                             debug!(
                                 "STUN 401 received. Current remote params: {:?}",
                                 remote_params
                             );
                         }
-                        trace!("Error code: {}", code);
+                        Some(code) => {
+                            trace!("STUN ErrorResponse {} from {}", code, addr);
+                        }
+                        None => {}
                     }
                 }
             }
@@ -1361,12 +1379,78 @@ async fn handle_packet(
     }
 }
 
+async fn handle_role_conflict(inner: &Arc<IceTransportInner>, msg: &StunDecoded, addr: SocketAddr) {
+    let local_tie = inner.local_parameters.lock().unwrap().tie_breaker;
+    let remote_tie = msg
+        .ice_controlling
+        .or(msg.ice_controlled)
+        .or_else(|| *inner.remote_tie_breaker.lock().unwrap());
+
+    let Some(remote_tie) = remote_tie else {
+        debug!(
+            "ICE role conflict (487) from {} but no remote tie-breaker available",
+            addr
+        );
+        return;
+    };
+
+    if remote_tie == local_tie {
+        warn!(
+            "ICE role conflict (487) from {} with equal tie-breaker {}; ignoring",
+            addr, local_tie
+        );
+        return;
+    }
+
+    let desired_role = if local_tie > remote_tie {
+        IceRole::Controlling
+    } else {
+        IceRole::Controlled
+    };
+
+    let role_changed = {
+        let mut role = inner.role.lock().unwrap();
+        if *role == desired_role {
+            trace!(
+                "ICE role conflict (487) from {} but role already {:?} (local_tie={} remote_tie={})",
+                addr,
+                desired_role,
+                local_tie,
+                remote_tie
+            );
+            false
+        } else {
+            debug!(
+                "ICE role conflict (487) from {}: switching role {:?} -> {:?} (local_tie={} remote_tie={})",
+                addr,
+                *role,
+                desired_role,
+                local_tie,
+                remote_tie
+            );
+            *role = desired_role;
+            true
+        }
+    };
+
+    if !role_changed {
+        return;
+    }
+
+    inner.checking_pairs.lock().await.clear();
+    let _ = inner.cmd_tx.send(IceCommand::RunChecks);
+}
+
 async fn handle_stun_request(
     sender: &IceSocketWrapper,
     msg: &StunDecoded,
     addr: SocketAddr,
     inner: Arc<IceTransportInner>,
 ) {
+    if let Some(remote_tie) = msg.ice_controlling.or(msg.ice_controlled) {
+        *inner.remote_tie_breaker.lock().unwrap() = Some(remote_tie);
+    }
+
     let response = StunMessage::binding_success_response(msg.transaction_id, addr);
 
     let password = inner.local_parameters.lock().unwrap().password.clone();
