@@ -28,6 +28,60 @@ fn parse_turn_uri() {
     assert_eq!(uri.kind, IceUriKind::Turn);
 }
 
+#[test]
+fn private_ipv4_range_mask_recognizes_rfc1918_ranges() {
+    use std::net::Ipv4Addr;
+
+    assert_eq!(private_ipv4_range_mask(Ipv4Addr::new(10, 0, 0, 1)), Some(1));
+    assert_eq!(
+        private_ipv4_range_mask(Ipv4Addr::new(172, 16, 0, 1)),
+        Some(1 << 1)
+    );
+    assert_eq!(
+        private_ipv4_range_mask(Ipv4Addr::new(172, 31, 255, 255)),
+        Some(1 << 1)
+    );
+    assert_eq!(private_ipv4_range_mask(Ipv4Addr::new(172, 32, 0, 1)), None);
+    assert_eq!(
+        private_ipv4_range_mask(Ipv4Addr::new(192, 168, 0, 1)),
+        Some(1 << 2)
+    );
+    assert_eq!(private_ipv4_range_mask(Ipv4Addr::new(8, 8, 8, 8)), None);
+}
+
+#[test]
+fn filter_remote_candidates_for_private_ranges_drops_mismatched_private_hosts_when_public_present() {
+    let locals = vec![IceCandidate::host("10.0.0.1:5000".parse().unwrap(), 1)];
+
+    let remote_private_mismatched =
+        IceCandidate::host("192.168.1.2:3478".parse().unwrap(), 1);
+    let remote_public_host = IceCandidate::host("8.8.8.8:3478".parse().unwrap(), 1);
+    let remote_private_matched = IceCandidate::host("10.1.2.3:3478".parse().unwrap(), 1);
+
+    let remotes = vec![
+        remote_private_mismatched.clone(),
+        remote_public_host.clone(),
+        remote_private_matched.clone(),
+    ];
+
+    let filtered = filter_remote_candidates_for_private_ranges(&locals, remotes);
+    assert!(!filtered.contains(&remote_private_mismatched));
+    assert!(filtered.contains(&remote_public_host));
+    assert!(filtered.contains(&remote_private_matched));
+}
+
+#[test]
+fn filter_remote_candidates_for_private_ranges_does_not_drop_all_private_hosts() {
+    let locals = vec![IceCandidate::host("10.0.0.1:5000".parse().unwrap(), 1)];
+    let remotes = vec![
+        IceCandidate::host("192.168.1.2:3478".parse().unwrap(), 1),
+        IceCandidate::host("172.16.0.2:3478".parse().unwrap(), 1),
+    ];
+
+    let filtered = filter_remote_candidates_for_private_ranges(&locals, remotes.clone());
+    assert_eq!(filtered, remotes);
+}
+
 #[tokio::test]
 async fn builder_starts_gathering() {
     let (transport, runner) = IceTransportBuilder::new(RtcConfiguration::default()).build();
