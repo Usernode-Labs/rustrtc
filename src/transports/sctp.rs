@@ -197,6 +197,7 @@ const RECONFIG_RESPONSE_IN_PROGRESS: u32 = 6;
 #[derive(Debug)]
 struct RtoCalculator {
     srtt: f64,
+    last_rtt: Option<f64>,
     rttvar: f64,
     rto: f64,
     min: f64,
@@ -207,6 +208,7 @@ impl RtoCalculator {
     fn new(initial: f64, min: f64, max: f64) -> Self {
         Self {
             srtt: 0.0,
+            last_rtt: None,
             rttvar: 0.0,
             rto: initial,
             min,
@@ -215,6 +217,7 @@ impl RtoCalculator {
     }
 
     fn update(&mut self, rtt: f64) {
+        self.last_rtt = Some(rtt);
         if self.srtt == 0.0 {
             self.srtt = rtt;
             self.rttvar = rtt / 2.0;
@@ -227,6 +230,10 @@ impl RtoCalculator {
 
     fn backoff(&mut self) {
         self.rto = (self.rto * 2.0).min(self.max);
+    }
+
+    fn last_rtt(&self) -> Option<f64> {
+        self.last_rtt
     }
 }
 
@@ -775,6 +782,19 @@ impl SctpTransport {
 
     pub fn buffered_amount(&self) -> usize {
         self.inner.flight_size.load(Ordering::SeqCst)
+    }
+
+    pub fn smoothed_rtt(&self) -> Option<f64> {
+        let srtt = self.inner.rto_state.lock().unwrap().srtt;
+        if srtt > 0.0 {
+            Some(srtt)
+        } else {
+            None
+        }
+    }
+
+    pub fn last_rtt(&self) -> Option<f64> {
+        self.inner.rto_state.lock().unwrap().last_rtt()
     }
 
     /// Returns the reason why the SCTP association closed, if available.
@@ -3345,12 +3365,14 @@ mod tests {
     fn test_rto_calculator() {
         let mut calc = RtoCalculator::new(1.0, 0.2, 60.0);
         assert_eq!(calc.rto, 1.0);
+        assert_eq!(calc.last_rtt(), None);
 
         // First measurement: RTT = 1.0
         calc.update(1.0);
         // srtt = 1.0, rttvar = 0.5
         // rto = 1.0 + 4 * 0.5 = 3.0
         assert_eq!(calc.srtt, 1.0);
+        assert_eq!(calc.last_rtt(), Some(1.0));
         assert_eq!(calc.rttvar, 0.5);
         assert_eq!(calc.rto, 3.0);
 
@@ -3360,6 +3382,7 @@ mod tests {
         // srtt = (1 - 0.125) * 1.0 + 0.125 * 1.0 = 1.0
         // rto = 1.0 + 4 * 0.375 = 1.0 + 1.5 = 2.5
         assert_eq!(calc.srtt, 1.0);
+        assert_eq!(calc.last_rtt(), Some(1.0));
         assert_eq!(calc.rttvar, 0.375);
         assert_eq!(calc.rto, 2.5);
 
