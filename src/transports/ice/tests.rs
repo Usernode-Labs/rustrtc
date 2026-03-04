@@ -82,6 +82,27 @@ fn filter_remote_candidates_for_private_ranges_does_not_drop_all_private_hosts()
     assert_eq!(filtered, remotes);
 }
 
+#[test]
+fn check_retry_sleep_and_next_caps_and_respects_remaining() {
+    let (sleep_for, next) = check_retry_sleep_and_next(CHECK_RETRY_BASE, Duration::from_secs(30));
+    assert_eq!(sleep_for, CHECK_RETRY_BASE);
+    assert_eq!(next, Duration::from_secs(1));
+
+    let (sleep_for, next) =
+        check_retry_sleep_and_next(Duration::from_secs(1), Duration::from_millis(200));
+    assert_eq!(sleep_for, Duration::from_millis(200));
+    assert_eq!(next, Duration::from_secs(2));
+
+    let (sleep_for, next) =
+        check_retry_sleep_and_next(Duration::from_secs(4), Duration::from_secs(30));
+    assert_eq!(sleep_for, Duration::from_secs(4));
+    assert_eq!(next, CHECK_RETRY_MAX);
+
+    let (sleep_for, next) = check_retry_sleep_and_next(CHECK_RETRY_MAX, Duration::from_secs(30));
+    assert_eq!(sleep_for, CHECK_RETRY_MAX);
+    assert_eq!(next, CHECK_RETRY_MAX);
+}
+
 #[tokio::test]
 async fn builder_starts_gathering() {
     let (transport, runner) = IceTransportBuilder::new(RtcConfiguration::default()).build();

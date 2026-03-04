@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, anyhow, bail};
 use tokio::net::{UdpSocket, lookup_host};
 use tokio::sync::{Mutex, broadcast, mpsc, oneshot, watch};
-use tokio::time::timeout;
+use tokio::time::{sleep, timeout};
 use tracing::{debug, instrument, trace, warn};
 
 #[cfg(any(test, feature = "simulator"))]
@@ -28,6 +28,9 @@ use self::stun::{
 use crate::{IceServer, IceTransportPolicy, RtcConfiguration};
 
 pub(crate) const MAX_STUN_MESSAGE: usize = 1500;
+
+const CHECK_RETRY_BASE: Duration = Duration::from_millis(500);
+const CHECK_RETRY_MAX: Duration = Duration::from_secs(5);
 
 #[cfg(any(test, feature = "simulator"))]
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -63,6 +66,13 @@ pub(crate) fn should_drop_packet() -> bool {
     }
 }
 
+fn check_retry_sleep_and_next(current_delay: Duration, remaining: Duration) -> (Duration, Duration) {
+    let sleep_for = std::cmp::min(current_delay, remaining);
+    let doubled = current_delay.checked_mul(2).unwrap_or(CHECK_RETRY_MAX);
+    let next_delay = std::cmp::min(doubled, CHECK_RETRY_MAX);
+    (sleep_for, next_delay)
+}
+
 #[derive(Debug)]
 enum IceCommand {
     StartGathering,
@@ -96,6 +106,8 @@ struct IceTransportInner {
     selected_pair_notifier: watch::Sender<Option<IceCandidatePair>>,
     _selected_pair_rx_keeper: watch::Receiver<Option<IceCandidatePair>>,
     last_received: std::sync::Mutex<Instant>,
+    ice_start: std::sync::Mutex<Option<Instant>>,
+    check_retry_delay: std::sync::Mutex<Duration>,
     candidate_tx: broadcast::Sender<IceCandidate>,
     cmd_tx: mpsc::UnboundedSender<IceCommand>,
     checking_pairs: Mutex<std::collections::HashSet<(SocketAddr, SocketAddr)>>,
@@ -570,6 +582,8 @@ impl IceTransport {
             selected_pair_notifier: selected_pair_tx,
             _selected_pair_rx_keeper: selected_pair_rx,
             last_received: std::sync::Mutex::new(Instant::now()),
+            ice_start: std::sync::Mutex::new(None),
+            check_retry_delay: std::sync::Mutex::new(CHECK_RETRY_BASE),
             candidate_tx: candidate_tx.clone(),
             cmd_tx,
             checking_pairs: Mutex::new(std::collections::HashSet::new()),
@@ -668,6 +682,8 @@ impl IceTransport {
             let mut params = self.inner.remote_parameters.lock().unwrap();
             *params = Some(remote);
         }
+        *self.inner.ice_start.lock().unwrap() = Some(Instant::now());
+        *self.inner.check_retry_delay.lock().unwrap() = CHECK_RETRY_BASE;
         if let Err(e) = self.inner.state.send(IceTransportState::Checking) {
             debug!("start: failed to set state to Checking: {}", e);
         }
@@ -914,6 +930,7 @@ impl IceTransport {
         let mut list = self.inner.remote_candidates.lock().unwrap();
         list.push(candidate);
         drop(list);
+        *self.inner.check_retry_delay.lock().unwrap() = CHECK_RETRY_BASE;
         self.try_connectivity_checks();
     }
 
@@ -1140,6 +1157,7 @@ async fn perform_connectivity_checks_async(inner: Arc<IceTransportInner>) {
                 let _ = inner.selected_socket.send(Some(socket));
             }
             let _ = inner.state.send(IceTransportState::Connected);
+            *inner.check_retry_delay.lock().unwrap() = CHECK_RETRY_BASE;
             success = true;
             debug!(
                 "ICE checks complete. Selected pair: {} -> {}",
@@ -1192,9 +1210,35 @@ async fn perform_connectivity_checks_async(inner: Arc<IceTransportInner>) {
     if !success {
         let state = *inner.state.borrow();
         let has_selected_pair = inner.selected_pair.lock().unwrap().is_some();
-        // Only set Failed if we're not already connected AND we don't have a working pair
-        if state != IceTransportState::Connected && !has_selected_pair {
-            let _ = inner.state.send(IceTransportState::Failed);
+        // Only retry if we're still checking and don't have a working pair.
+        if state == IceTransportState::Checking && !has_selected_pair {
+            let timeout_window = inner.config.ice_connection_timeout;
+            let elapsed = inner
+                .ice_start
+                .lock()
+                .unwrap()
+                .map(|start| start.elapsed())
+                .unwrap_or(Duration::ZERO);
+            if elapsed >= timeout_window {
+                let _ = inner.state.send(IceTransportState::Failed);
+                return;
+            }
+
+            let remaining = timeout_window.saturating_sub(elapsed);
+            let sleep_for = {
+                let mut delay = inner.check_retry_delay.lock().unwrap();
+                let (sleep_for, next_delay) = check_retry_sleep_and_next(*delay, remaining);
+                *delay = next_delay;
+                sleep_for
+            };
+
+            let inner_weak = Arc::downgrade(&inner);
+            tokio::spawn(async move {
+                sleep(sleep_for).await;
+                if let Some(inner) = inner_weak.upgrade() {
+                    let _ = inner.cmd_tx.send(IceCommand::RunChecks);
+                }
+            });
         }
     }
 }
@@ -1551,6 +1595,7 @@ async fn handle_stun_request(
                     let _ = inner.selected_socket.send(Some(socket));
                 }
                 let _ = inner.state.send(IceTransportState::Connected);
+                *inner.check_retry_delay.lock().unwrap() = CHECK_RETRY_BASE;
                 // Controlled side: nomination is decided by the controlling agent;
                 // once we receive USE-CANDIDATE, our "nomination" is complete.
                 let _ = inner.nomination_complete.send(Some(true));
