@@ -3,7 +3,9 @@ use crate::media::track::{MediaStreamTrack, SampleStreamSource, SampleStreamTrac
 use crate::rtp::{
     FirRequest, FullIntraRequest, GenericNack, PictureLossIndication, RtcpPacket, RtpPacket,
 };
-use crate::stats::{StatsReport, gather_once};
+use crate::stats::{
+    DynProvider, StatsEntry, StatsId, StatsKind, StatsProvider, StatsReport, gather_once,
+};
 use crate::stats_collector::StatsCollector;
 use crate::transports::dtls::{self, DtlsTransport};
 use crate::transports::get_local_ip;
@@ -16,6 +18,7 @@ use crate::{
     RtcError, RtcResult, SdpType, SessionDescription, TransportMode, VideoCapability,
 };
 use base64::prelude::*;
+use serde_json::json;
 use std::collections::{HashMap, VecDeque};
 use std::net::{IpAddr, Ipv4Addr};
 use std::{
@@ -298,6 +301,44 @@ struct PeerConnectionInner {
     ssrc_generator: AtomicU32,
     disconnect_reason: watch::Sender<Option<DisconnectReason>>,
     _disconnect_reason_rx: watch::Receiver<Option<DisconnectReason>>,
+}
+
+struct SctpStatsProvider {
+    inner: Weak<PeerConnectionInner>,
+}
+
+#[async_trait]
+impl StatsProvider for SctpStatsProvider {
+    async fn collect(&self) -> RtcResult<Vec<StatsEntry>> {
+        let Some(inner) = self.inner.upgrade() else {
+            return Ok(Vec::new());
+        };
+
+        let transport = inner.sctp_transport.lock().unwrap().clone();
+        let Some(transport) = transport else {
+            return Ok(Vec::new());
+        };
+
+        let smoothed_rtt = transport.smoothed_rtt();
+        let last_rtt = transport.last_rtt();
+        if smoothed_rtt.is_none() && last_rtt.is_none() {
+            return Ok(Vec::new());
+        }
+
+        let mut entry = StatsEntry::new(StatsId::new("sctp-transport"), StatsKind::DataChannel);
+        if let Some(v) = smoothed_rtt {
+            entry = entry
+                .with_value("currentRoundTripTime", json!(v))
+                .with_value("sctpSmoothedRtt", json!(v));
+        }
+        if let Some(v) = last_rtt {
+            entry = entry
+                .with_value("lastRoundTripTime", json!(v))
+                .with_value("sctpLastRtt", json!(v));
+        }
+
+        Ok(vec![entry])
+    }
 }
 
 fn generate_sdes_key_params() -> String {
@@ -1947,7 +1988,13 @@ impl PeerConnection {
     }
 
     pub async fn get_stats(&self) -> RtcResult<StatsReport> {
-        gather_once(&[self.inner.stats_collector.clone()]).await
+        let providers: [Arc<DynProvider>; 2] = [
+            self.inner.stats_collector.clone(),
+            Arc::new(SctpStatsProvider {
+                inner: Arc::downgrade(&self.inner),
+            }),
+        ];
+        gather_once(&providers).await
     }
 
     pub async fn wait_for_gathering_complete(&self) {
