@@ -15,6 +15,16 @@ use tracing::{debug, trace};
 
 type HmacSha1 = Hmac<Sha1>;
 
+const SCTP_DIAG_TARGET: &str = "rustrtc::sctp_diag";
+
+macro_rules! sctp_diag {
+    ($enabled:expr, $($arg:tt)*) => {
+        if $enabled {
+            tracing::info!(target: SCTP_DIAG_TARGET, $($arg)*);
+        }
+    };
+}
+
 // RTO Constants (RFC 4960)
 const RTO_ALPHA: f64 = 0.125;
 const RTO_BETA: f64 = 0.25;
@@ -265,6 +275,7 @@ struct SctpInner {
     timer_notify: Arc<Notify>,
     flow_control_notify: Arc<Notify>,
     sack_needed: AtomicBool,
+    gap_sack_not_before: Mutex<Option<Instant>>,
     last_sack_sig: AtomicU64,
     dups_buffer: Mutex<Vec<u32>>, // duplicate TSNs to include in next SACK
 
@@ -283,10 +294,16 @@ struct SctpInner {
     max_association_retransmits: u32,
 
     // Configurable parameters from RtcConfiguration
+    diag_enabled: bool,
+    no_sack_sig_gating: bool,
+    cwnd_initial: usize,
+    slow_start_increase_cap: usize,
     heartbeat_interval: Duration,
     max_heartbeat_failures: u32,
     max_burst_packets: usize, // 0 = use default heuristic
+    unlimited_burst_non_recovery: bool,
     max_cwnd: usize,
+    gap_sack_delay_srtt_divisor: u32,
 
     // Association Error Counter
     association_error_count: AtomicU32,
@@ -412,6 +429,7 @@ fn apply_sack_to_sent_queue(
     cumulative_tsn_ack: u32,
     gap_blocks: &[(u16, u16)],
     now: Instant,
+    diag_enabled: bool,
     count_missing_reports: bool,
 ) -> SackOutcome {
     let before_head = sent_queue.keys().next().cloned();
@@ -526,11 +544,20 @@ fn apply_sack_to_sent_queue(
     // Use order-aware iteration up to max_reported.
     let mut to_retransmit = Vec::new();
     let mut missing_count = 0;
+    let diag = diag_enabled;
+    let mut skipped_missing = 0usize;
+    let mut skipped_first_tsn: Option<u32> = None;
     for (&tsn, record) in sent_queue.iter_mut() {
         // if tsn <= max_reported
         if (tsn.wrapping_sub(max_reported) as i32) <= 0 {
             if !record.acked {
                 if !count_missing_reports {
+                    if diag {
+                        skipped_missing += 1;
+                        if skipped_first_tsn.is_none() {
+                            skipped_first_tsn = Some(tsn);
+                        }
+                    }
                     continue;
                 }
                 missing_count += 1;
@@ -588,11 +615,30 @@ fn apply_sack_to_sent_queue(
                         "Fast retransmit triggered for TSN {} after {} missing reports (retrans #{})",
                         tsn, DUP_THRESH, record.transmit_count
                     );
+                    if diag {
+                        sctp_diag!(
+                            diag_enabled,
+                            "Fast retransmit: tsn={}, retransmit_count={}",
+                            tsn,
+                            record.transmit_count
+                        );
+                    }
 
                     to_retransmit.push((tsn, record.payload.clone()));
                 }
             }
         }
+    }
+
+    if diag && !count_missing_reports && skipped_missing > 0 {
+        sctp_diag!(
+            diag_enabled,
+            "Duplicate SACK: skipped missing_reports for {} TSNs (first_missing_tsn={}, cum_ack={}, max_reported={})",
+            skipped_missing,
+            skipped_first_tsn.unwrap_or(0),
+            cumulative_tsn_ack,
+            max_reported
+        );
     }
 
     if missing_count > 0 && to_retransmit.is_empty() {
@@ -656,6 +702,57 @@ impl SctpTransport {
     ) {
         let (outgoing_packet_tx, mut outgoing_packet_rx) = mpsc::unbounded_channel::<Bytes>();
 
+        let diag_enabled = config.sctp_diag_enabled;
+        let no_sack_sig_gating = config.sctp_no_sack_sig_gating;
+
+        let max_cwnd = config.sctp_max_cwnd.max(MAX_SCTP_PACKET_SIZE);
+        let cwnd_initial = if config.sctp_initial_cwnd > 0 {
+            config.sctp_initial_cwnd
+        } else {
+            CWND_INITIAL
+        }
+        .max(MAX_SCTP_PACKET_SIZE)
+        .min(max_cwnd);
+
+        let slow_start_increase_cap = if config.sctp_slow_start_increase_cap > 0 {
+            config.sctp_slow_start_increase_cap
+        } else {
+            cwnd_initial
+        }
+        .max(MAX_SCTP_PACKET_SIZE)
+        .min(max_cwnd);
+
+        let burst_limit_normal_packets = if config.sctp_max_burst > 0 {
+            Some(config.sctp_max_burst)
+        } else if config.sctp_unlimited_burst_non_recovery {
+            None
+        } else {
+            Some(16)
+        };
+        let burst_limit_recovery_packets = if config.sctp_max_burst > 0 {
+            config.sctp_max_burst
+        } else {
+            4
+        };
+
+        sctp_diag!(
+            diag_enabled,
+            "SCTP init: is_client={}, rto_initial={:?}, rto_min={:?}, rto_max={:?}, rwnd_local={}, max_assoc_retransmits={}, cwnd_initial={}, slow_start_cap={}, max_cwnd={}, burst_normal_pkts={:?}, burst_recovery_pkts={}, gap_sack_srtt_divisor={}, no_sack_sig_gating={}",
+            is_client,
+            config.sctp_rto_initial,
+            config.sctp_rto_min,
+            config.sctp_rto_max,
+            config.sctp_receive_window,
+            config.sctp_max_association_retransmits,
+            cwnd_initial,
+            slow_start_increase_cap,
+            max_cwnd,
+            burst_limit_normal_packets,
+            burst_limit_recovery_packets,
+            config.sctp_gap_sack_delay_srtt_divisor,
+            no_sack_sig_gating
+        );
+
         let inner = Arc::new(SctpInner {
             dtls_transport: dtls_transport.clone(),
             state: Arc::new(Mutex::new(SctpState::New)),
@@ -676,14 +773,15 @@ impl SctpTransport {
                 config.sctp_rto_max.as_secs_f64(),
             )),
             flight_size: AtomicUsize::new(0),
-            cwnd_tx: AtomicUsize::new(CWND_INITIAL), // Independent cwnd for sending direction
-            cwnd_rx: AtomicUsize::new(CWND_INITIAL), // Independent cwnd for receiving/echo direction
+            cwnd_tx: AtomicUsize::new(cwnd_initial), // Independent cwnd for sending direction
+            cwnd_rx: AtomicUsize::new(cwnd_initial), // Independent cwnd for receiving/echo direction
             ssthresh: AtomicUsize::new(usize::MAX),
             partial_bytes_acked: AtomicUsize::new(0),
             peer_rwnd: AtomicU32::new(256 * 1024), // Default 256KB until we hear from peer
             timer_notify: Arc::new(Notify::new()),
             flow_control_notify: Arc::new(Notify::new()),
             sack_needed: AtomicBool::new(false),
+            gap_sack_not_before: Mutex::new(None),
             last_sack_sig: AtomicU64::new(0),
             dups_buffer: Mutex::new(Vec::new()),
             reconfig_request_sn: AtomicU32::new(0),
@@ -694,10 +792,16 @@ impl SctpTransport {
             fast_recovery_transmit: AtomicBool::new(false),
             last_fast_recovery_entry: Mutex::new(Instant::now() - Duration::from_secs(10)),
             max_association_retransmits: config.sctp_max_association_retransmits,
+            diag_enabled,
+            no_sack_sig_gating,
+            cwnd_initial,
+            slow_start_increase_cap,
             heartbeat_interval: config.sctp_heartbeat_interval,
             max_heartbeat_failures: config.sctp_max_heartbeat_failures,
             max_burst_packets: config.sctp_max_burst,
-            max_cwnd: config.sctp_max_cwnd,
+            unlimited_burst_non_recovery: config.sctp_unlimited_burst_non_recovery,
+            max_cwnd,
+            gap_sack_delay_srtt_divisor: config.sctp_gap_sack_delay_srtt_divisor,
             association_error_count: AtomicU32::new(0),
             heartbeat_sent_time: Mutex::new(None),
             consecutive_heartbeat_failures: AtomicU32::new(0),
@@ -989,7 +1093,31 @@ impl SctpInner {
                 Duration::from_secs(3600)
             };
 
-            let sleep_duration = rto_timeout.min(heartbeat_timeout).min(t1_timeout);
+            // 4. Calculate Gap SACK timeout (reordering tolerance):
+            // When we have buffered out-of-order packets (gaps), we intentionally delay
+            // SACK emission a bit (based on RTT) so jitter doesn't trigger spurious fast
+            // retransmits / cwnd collapse.
+            let gap_sack_timeout = if self.sack_needed.load(Ordering::Relaxed)
+                && !self.received_queue.lock().unwrap().is_empty()
+            {
+                let deadline = *self.gap_sack_not_before.lock().unwrap();
+                if let Some(deadline) = deadline {
+                    if deadline > now {
+                        deadline - now
+                    } else {
+                        Duration::from_millis(1)
+                    }
+                } else {
+                    Duration::from_millis(1)
+                }
+            } else {
+                Duration::from_secs(3600)
+            };
+
+            let sleep_duration = rto_timeout
+                .min(heartbeat_timeout)
+                .min(t1_timeout)
+                .min(gap_sack_timeout);
 
             tokio::select! {
                 _ = close_rx.notified() => {
@@ -1043,6 +1171,11 @@ impl SctpInner {
                             debug!("Failed to send HEARTBEAT: {}", e);
                         }
                         last_heartbeat = Instant::now();
+                    }
+
+                    // Try to transmit after timer events (e.g. delayed SACK, retransmits).
+                    if let Err(e) = self.transmit().await {
+                        debug!("SCTP transmit error after timer: {}", e);
                     }
                 },
                 res = incoming_data_rx.recv() => {
@@ -1179,7 +1312,10 @@ impl SctpInner {
     // aiortc-style T3 expiry logic
     async fn handle_timeout(&self) -> Result<()> {
         let now = Instant::now();
-        let rto = { self.rto_state.lock().unwrap().rto };
+        let (rto, srtt, rttvar) = {
+            let rto_state = self.rto_state.lock().unwrap();
+            (rto_state.rto, rto_state.srtt, rto_state.rttvar)
+        };
         let rto_dur = Duration::from_secs_f64(rto);
         {
             let last_fire = self.last_t3_fire_time.lock().unwrap();
@@ -1193,19 +1329,48 @@ impl SctpInner {
             }
         }
 
-        let mut t3_expired = false;
-        {
+        let (expired_sample, sent_queue_len_for_diag) = {
             let sent_queue = self.sent_queue.lock().unwrap();
-            for (_, record) in sent_queue.iter() {
+            let sent_queue_len_for_diag = sent_queue.len();
+            let mut expired_sample: Option<(u32, Duration, u32)> = None;
+            for (tsn, record) in sent_queue.iter() {
                 if !record.acked && !record.abandoned && now >= record.sent_time + rto_dur {
-                    t3_expired = true;
+                    expired_sample =
+                        Some((*tsn, now.duration_since(record.sent_time), record.transmit_count));
                     break;
                 }
             }
+            (expired_sample, sent_queue_len_for_diag)
+        };
+
+        if expired_sample.is_none() {
+            return Ok(());
         }
 
-        if !t3_expired {
-            return Ok(());
+        if let Some((tsn, age, transmit_count)) = expired_sample {
+            let state = *self.state.lock().unwrap();
+            let flight_size = self.flight_size.load(Ordering::SeqCst);
+            let cwnd = self.cwnd_tx.load(Ordering::SeqCst);
+            let ssthresh = self.ssthresh.load(Ordering::SeqCst);
+            let peer_rwnd = self.peer_rwnd.load(Ordering::SeqCst);
+            let queued_bytes = self.queued_bytes.load(Ordering::SeqCst);
+            sctp_diag!(
+                self.diag_enabled,
+                "T3 expired: tsn={}, age_ms={}, transmit_count={}, rto_ms={}, srtt_ms={:.1}, rttvar_ms={:.1}, cwnd={}, ssthresh={}, flight={}, peer_rwnd={}, queued_bytes={}, sent_queue_len={}, state={:?}",
+                tsn,
+                age.as_millis(),
+                transmit_count,
+                Duration::from_secs_f64(rto).as_millis(),
+                srtt * 1000.0,
+                rttvar * 1000.0,
+                cwnd,
+                ssthresh,
+                flight_size,
+                peer_rwnd,
+                queued_bytes,
+                sent_queue_len_for_diag,
+                state
+            );
         }
 
         // Record T3 fire time BEFORE backoff
@@ -1268,6 +1433,21 @@ impl SctpInner {
                         record.sent_time = now;
                     }
                 }
+            }
+
+            if let Some(tsn) = retransmitted_tsn {
+                sctp_diag!(
+                    self.diag_enabled,
+                    "T3 action: retransmit_tsn={}, new_rto_ms={}",
+                    tsn,
+                    Duration::from_secs_f64(new_rto).as_millis()
+                );
+            } else {
+                sctp_diag!(
+                    self.diag_enabled,
+                    "T3 action: no retransmit scheduled (all outstanding abandoned?), new_rto_ms={}",
+                    Duration::from_secs_f64(new_rto).as_millis()
+                );
             }
         }
 
@@ -1637,6 +1817,7 @@ impl SctpInner {
             let num_gap_ack_blocks = buf.get_u16();
             let _num_duplicate_tsns = buf.get_u16();
             let old_rwnd = self.peer_rwnd.swap(a_rwnd, Ordering::SeqCst);
+            let flight_before_ack = self.flight_size.load(Ordering::SeqCst);
 
             // Log peer_rwnd to understand flow control
             if a_rwnd < 100000 {
@@ -1666,9 +1847,18 @@ impl SctpInner {
                 }
                 sig
             };
-            let count_missing_reports = {
+            let count_missing_reports = if self.no_sack_sig_gating {
+                self.last_sack_sig.store(sack_sig, Ordering::SeqCst);
+                true
+            } else {
                 let last = self.last_sack_sig.load(Ordering::SeqCst);
                 if last == sack_sig {
+                    sctp_diag!(
+                        self.diag_enabled,
+                        "SACK duplicate signature: cum_ack={}, gaps={} (skipping missing report counting)",
+                        cumulative_tsn_ack,
+                        gap_blocks.len()
+                    );
                     false
                 } else {
                     self.last_sack_sig.store(sack_sig, Ordering::SeqCst);
@@ -1706,6 +1896,7 @@ impl SctpInner {
                     cumulative_tsn_ack,
                     &gap_blocks,
                     now,
+                    self.diag_enabled,
                     count_missing_reports,
                 )
             };
@@ -1725,7 +1916,8 @@ impl SctpInner {
                 if ssthresh <= SSTHRESH_MIN && outcome.bytes_acked_by_cum_tsn > 0 {
                     let cwnd = self.cwnd_tx.load(Ordering::SeqCst);
                     if cwnd >= ssthresh * 4 / 5 {
-                        let new_ssthresh = (cwnd * 2).max(CWND_INITIAL * 2).min(self.max_cwnd);
+                        let new_ssthresh =
+                            (cwnd * 2).max(self.cwnd_initial * 2).min(self.max_cwnd);
                         self.ssthresh.store(new_ssthresh, Ordering::SeqCst);
                         debug!(
                             "Raising ssthresh {} -> {} to allow faster recovery (cwnd={})",
@@ -1795,6 +1987,8 @@ impl SctpInner {
                 // Congestion Control: Update cwnd_tx for outbound traffic
                 let cwnd = self.cwnd_tx.load(Ordering::SeqCst);
                 let ssthresh = self.ssthresh.load(Ordering::SeqCst);
+                let queued_bytes = self.queued_bytes.load(Ordering::SeqCst);
+                let flight_after_ack = self.flight_size.load(Ordering::SeqCst);
 
                 // Check if we are in Fast Recovery
                 let exit_tsn = self.fast_recovery_exit_tsn.load(Ordering::SeqCst);
@@ -1809,18 +2003,42 @@ impl SctpInner {
                         "Exiting Fast Recovery! cum_ack: {}, exit_tsn: {}",
                         cumulative_tsn_ack, exit_tsn
                     );
+                    sctp_diag!(
+                        self.diag_enabled,
+                        "Fast recovery exit: cum_ack={}, exit_tsn={}, cwnd={}, ssthresh={}, flight_before={}, flight_after={}, queued_bytes={}",
+                        cumulative_tsn_ack,
+                        exit_tsn,
+                        cwnd,
+                        ssthresh,
+                        flight_before_ack,
+                        flight_after_ack,
+                        queued_bytes
+                    );
                 }
 
                 if in_fast_recovery {
                     // In Fast Recovery, we don't increase cwnd normally.
                 } else {
                     let done_bytes = outcome.bytes_acked_by_cum_tsn + outcome.bytes_acked_by_gap;
-                    let cwnd_fully_utilized = self.flight_size.load(Ordering::SeqCst) >= cwnd;
+                    let has_backlog = queued_bytes > 0;
+                    let cwnd_was_effectively_full =
+                        cwnd.saturating_sub(flight_before_ack) < MAX_SCTP_PACKET_SIZE;
+                    let cwnd_is_effectively_full =
+                        cwnd.saturating_sub(flight_after_ack) < MAX_SCTP_PACKET_SIZE;
+                    let cwnd_fully_utilized =
+                        has_backlog && (cwnd_was_effectively_full || cwnd_is_effectively_full);
 
                     if done_bytes > 0 && cwnd_fully_utilized && cwnd < self.max_cwnd {
                         if cwnd <= ssthresh {
-                            // Slow Start (aiortc): cwnd += min(done_bytes, MTU)
-                            let increase = done_bytes.min(MAX_SCTP_PACKET_SIZE);
+                            // Slow Start: cwnd += bytes_acked (exponential growth).
+                            //
+                            // Note: The SCTP receive path may coalesce many DATA chunks into a
+                            // single SACK (e.g. when the run_loop drains the incoming packet
+                            // channel). If we cap growth to a tiny value per SACK, slow start
+                            // becomes artificially slow under latency/jitter. Instead, allow
+                            // growth proportional to the bytes ACKed, but cap the increase to
+                            // IW10 per SACK to avoid overshooting on large cumulative ACKs.
+                            let increase = done_bytes.min(self.slow_start_increase_cap);
                             let new_cwnd = (cwnd + increase).min(self.max_cwnd);
                             let actual_increase = new_cwnd - cwnd;
                             if actual_increase > 0 {
@@ -1830,6 +2048,19 @@ impl SctpInner {
                                 "Congestion Control: Slow Start cwnd_tx {} -> {} (ssthresh={}, increase={})",
                                 cwnd, new_cwnd, ssthresh, actual_increase
                             );
+                            if actual_increase > 0 {
+                                sctp_diag!(
+                                    self.diag_enabled,
+                                    "CC cwnd grow (slow start): {} -> {} (ssthresh={}, acked_bytes={}, flight_before={}, flight_after={}, queued_bytes={})",
+                                    cwnd,
+                                    new_cwnd,
+                                    ssthresh,
+                                    done_bytes,
+                                    flight_before_ack,
+                                    flight_after_ack,
+                                    queued_bytes
+                                );
+                            }
                         } else {
                             // Congestion Avoidance: cwnd += MTU per RTT
                             let pba = self
@@ -1847,6 +2078,16 @@ impl SctpInner {
                                     "Congestion Control: Congestion Avoidance cwnd_tx {} -> {} (ssthresh={}, pba={})",
                                     cwnd, new_cwnd, ssthresh, total_pba
                                 );
+                                if actual_increase > 0 {
+                                    sctp_diag!(
+                                        self.diag_enabled,
+                                        "CC cwnd grow (congestion avoidance): {} -> {} (ssthresh={}, pba={})",
+                                        cwnd,
+                                        new_cwnd,
+                                        ssthresh,
+                                        total_pba
+                                    );
+                                }
                             }
                         }
                     }
@@ -2632,6 +2873,37 @@ impl SctpInner {
         self.local_rwnd.saturating_sub(used).try_into().unwrap_or(0)
     }
 
+    fn burst_limit_bytes(&self, in_recovery: bool) -> Option<usize> {
+        if self.max_burst_packets > 0 {
+            return Some(self.max_burst_packets.saturating_mul(MAX_SCTP_PACKET_SIZE));
+        }
+
+        if in_recovery {
+            return Some(4 * MAX_SCTP_PACKET_SIZE);
+        }
+
+        if self.unlimited_burst_non_recovery {
+            None
+        } else {
+            Some(16 * MAX_SCTP_PACKET_SIZE)
+        }
+    }
+
+    fn compute_gap_sack_delay(&self) -> Duration {
+        let divisor = self.gap_sack_delay_srtt_divisor;
+        if divisor == 0 {
+            return Duration::ZERO;
+        }
+
+        let srtt = self.rto_state.lock().unwrap().srtt;
+        if srtt == 0.0 {
+            return Duration::from_millis(50);
+        }
+
+        let ms = (srtt * 1000.0 / divisor as f64).round() as u64;
+        Duration::from_millis(ms.clamp(20, 200))
+    }
+
     async fn send_chunk(
         &self,
         type_: u8,
@@ -2872,9 +3144,55 @@ impl SctpInner {
 
     async fn transmit(&self) -> Result<()> {
         let mut chunks_to_send = Vec::new();
+        let mut diag_sack = 0usize;
+        let mut diag_retransmit = 0usize;
+        let mut diag_new = 0usize;
+        let mut diag_new_bytes = 0usize;
+        let mut diag_forward_tsn = 0usize;
 
         if self.sack_needed.swap(false, Ordering::Acquire) {
-            chunks_to_send.push(self.create_sack_chunk());
+            let has_gap = !self.received_queue.lock().unwrap().is_empty();
+            if has_gap {
+                let delay = self.compute_gap_sack_delay();
+                let now = Instant::now();
+                let mut not_before = self.gap_sack_not_before.lock().unwrap();
+                if delay.is_zero() {
+                    *not_before = None;
+                    chunks_to_send.push(self.create_sack_chunk());
+                    diag_sack += 1;
+                } else {
+                    match *not_before {
+                        None => {
+                            *not_before = Some(now + delay);
+                            self.sack_needed.store(true, Ordering::Release);
+                            if self.diag_enabled {
+                                let srtt = self.rto_state.lock().unwrap().srtt;
+                                sctp_diag!(
+                                    self.diag_enabled,
+                                    "Gap SACK delayed: delay_ms={}, srtt_ms={:.1}",
+                                    delay.as_millis(),
+                                    srtt * 1000.0
+                                );
+                            }
+                        }
+                        Some(deadline) if now < deadline => {
+                            // Still in the delay window; keep SACK pending.
+                            self.sack_needed.store(true, Ordering::Release);
+                        }
+                        Some(_) => {
+                            // Delay elapsed; send now and throttle subsequent gap SACKs.
+                            *not_before = Some(now + delay);
+                            chunks_to_send.push(self.create_sack_chunk());
+                            diag_sack += 1;
+                        }
+                    }
+                }
+            } else {
+                // No gap: send SACK immediately and reset gap throttle.
+                *self.gap_sack_not_before.lock().unwrap() = None;
+                chunks_to_send.push(self.create_sack_chunk());
+                diag_sack += 1;
+            }
         }
 
         // 1. Calculate Effective Window
@@ -2885,18 +3203,10 @@ impl SctpInner {
         let in_recovery = self.fast_recovery_active.load(Ordering::Relaxed)
             || self.fast_recovery_exit_tsn.load(Ordering::Relaxed) != 0;
 
-        // Burst limit: configurable via sctp_max_burst (in MTU-sized packets).
-        // 0 = use default heuristic (16 normal, 4 recovery).
-        let burst_limit = if self.max_burst_packets > 0 {
-            // Explicit limit configured (e.g., for rate-limited TURN relays)
-            self.max_burst_packets * MAX_SCTP_PACKET_SIZE
-        } else if in_recovery {
-            4 * MAX_SCTP_PACKET_SIZE
-        } else {
-            16 * MAX_SCTP_PACKET_SIZE
+        let burst_constrained_cwnd = match self.burst_limit_bytes(in_recovery) {
+            Some(burst_limit) => flight_val.saturating_add(burst_limit).min(cwnd_val),
+            None => cwnd_val,
         };
-
-        let burst_constrained_cwnd = (flight_val + burst_limit).min(cwnd_val);
 
         let effective_window = burst_constrained_cwnd.min(rwnd_val);
 
@@ -2907,6 +3217,7 @@ impl SctpInner {
 
             for (_, record) in sent.iter_mut() {
                 if record.needs_retransmit {
+                    diag_retransmit += 1;
                     if recovery_tx {
                         self.fast_recovery_transmit.store(false, Ordering::Relaxed);
                         recovery_tx = false;
@@ -2931,23 +3242,47 @@ impl SctpInner {
         {
             let available =
                 effective_window.saturating_sub(self.flight_size.load(Ordering::Relaxed));
-            let mut budget = available;
-            let mut batch: Vec<OutboundChunk> = Vec::new();
-            let mut dequeued_bytes = 0usize;
-            {
-                let mut outbound = self.outbound_queue.lock().unwrap();
-                while budget > 0 && batch.len() < 1000 {
-                    if let Some(chunk_info) = outbound.pop_front() {
-                        let chunk_wire_size = CHUNK_HEADER_SIZE + 12 + chunk_info.payload.len();
-                        let padded = chunk_wire_size + (4 - (chunk_wire_size % 4)) % 4;
-                        dequeued_bytes += chunk_info.payload.len();
-                        budget = budget.saturating_sub(padded);
-                        batch.push(chunk_info);
-                    } else {
-                        break;
-                    }
+            if self.diag_enabled {
+                let queued = self.queued_bytes.load(Ordering::Relaxed);
+                if queued > 0 && available == 0 {
+                    let rto = { self.rto_state.lock().unwrap().rto };
+                    sctp_diag!(
+                        self.diag_enabled,
+                        "TX blocked: queued_bytes={}, cwnd={}, flight={}, rwnd={}, effective_window={}, rto_ms={}",
+                        queued,
+                        cwnd_val,
+                        flight_val,
+                        rwnd_val,
+                        effective_window,
+                        Duration::from_secs_f64(rto).as_millis()
+                    );
                 }
             }
+            let mut budget = available;
+                let mut batch: Vec<OutboundChunk> = Vec::new();
+                let mut dequeued_bytes = 0usize;
+                {
+                    let mut outbound = self.outbound_queue.lock().unwrap();
+                    while budget > 0 && batch.len() < 1000 {
+                        let padded = {
+                            let Some(front) = outbound.front() else {
+                                break;
+                            };
+                            let chunk_wire_size = CHUNK_HEADER_SIZE + 12 + front.payload.len();
+                            chunk_wire_size + (4 - (chunk_wire_size % 4)) % 4
+                        };
+                        if padded > budget {
+                            break;
+                        }
+
+                        let chunk_info = outbound
+                            .pop_front()
+                            .expect("front() returned Some; pop_front() must succeed");
+                        dequeued_bytes += chunk_info.payload.len();
+                        budget -= padded;
+                        batch.push(chunk_info);
+                    }
+                }
             if dequeued_bytes > 0 {
                 self.queued_bytes
                     .fetch_sub(dequeued_bytes, Ordering::Relaxed);
@@ -2965,6 +3300,8 @@ impl SctpInner {
                     chunk_info.flags,
                     tsn,
                 );
+                diag_new += 1;
+                diag_new_bytes += chunk_info.payload.len();
 
                 let record = ChunkRecord {
                     payload: wire_chunk.clone(),
@@ -2998,8 +3335,37 @@ impl SctpInner {
             if self.forward_tsn_pending.swap(false, Ordering::SeqCst) {
                 if let Some(fwd_chunk) = self.create_forward_tsn_chunk() {
                     chunks_to_send.push(fwd_chunk);
+                    diag_forward_tsn += 1;
                 }
             }
+        }
+
+        if self.diag_enabled && !chunks_to_send.is_empty() {
+            let sent_queue_len = self.sent_queue.lock().unwrap().len();
+            let (rto, srtt, rttvar) = {
+                let rto_state = self.rto_state.lock().unwrap();
+                (rto_state.rto, rto_state.srtt, rto_state.rttvar)
+            };
+            let state = *self.state.lock().unwrap();
+            let queued = self.queued_bytes.load(Ordering::Relaxed);
+            sctp_diag!(
+                self.diag_enabled,
+                "TX: sack={}, retransmit={}, new_chunks={} (new_bytes={}), fwd_tsn={}, cwnd={}, flight={}, rwnd={}, queued_bytes={}, sent_queue_len={}, rto_ms={}, srtt_ms={:.1}, rttvar_ms={:.1}, state={:?}",
+                diag_sack,
+                diag_retransmit,
+                diag_new,
+                diag_new_bytes,
+                diag_forward_tsn,
+                self.cwnd_tx.load(Ordering::Relaxed),
+                self.flight_size.load(Ordering::Relaxed),
+                self.peer_rwnd.load(Ordering::Relaxed),
+                queued,
+                sent_queue_len,
+                Duration::from_secs_f64(rto).as_millis(),
+                srtt * 1000.0,
+                rttvar * 1000.0,
+                state
+            );
         }
 
         if !chunks_to_send.is_empty() {
@@ -3510,7 +3876,8 @@ mod tests {
         );
 
         // Ack cumulative 10 and gap-ack 12, leaving 11 outstanding.
-        let outcome = apply_sack_to_sent_queue(&mut sent, 10, &[(2, 2)], Instant::now(), true);
+        let outcome =
+            apply_sack_to_sent_queue(&mut sent, 10, &[(2, 2)], Instant::now(), false, true);
 
         assert_eq!(outcome.flight_reduction, 2); // a cumulative-acked + c gap-acked
         assert_eq!(outcome.rtt_samples.len(), 2);
@@ -3554,14 +3921,14 @@ mod tests {
         let sack_gap = [(2u16, 2u16)];
         let mut outcome;
 
-        outcome = apply_sack_to_sent_queue(&mut sent, 21, &sack_gap, Instant::now(), true);
+        outcome = apply_sack_to_sent_queue(&mut sent, 21, &sack_gap, Instant::now(), false, true);
         assert_eq!(outcome.retransmit.len(), 0);
         assert_eq!(sent.len(), 2); // 21 removed, 22 and 23 remain (23 acked)
 
-        outcome = apply_sack_to_sent_queue(&mut sent, 21, &sack_gap, Instant::now(), true);
+        outcome = apply_sack_to_sent_queue(&mut sent, 21, &sack_gap, Instant::now(), false, true);
         assert_eq!(outcome.retransmit.len(), 0);
 
-        outcome = apply_sack_to_sent_queue(&mut sent, 21, &sack_gap, Instant::now(), true);
+        outcome = apply_sack_to_sent_queue(&mut sent, 21, &sack_gap, Instant::now(), false, true);
         assert_eq!(outcome.retransmit.len(), 1);
         assert_eq!(outcome.retransmit[0].0, 22);
         let rec = sent.get(&22).unwrap();
@@ -5673,14 +6040,15 @@ mod tests {
         }
 
         // Third SACK triggers fast retransmit for TSN 10
-        let outcome = apply_sack_to_sent_queue(&mut sent, 9, &[(2, 4)], Instant::now(), true);
+        let outcome =
+            apply_sack_to_sent_queue(&mut sent, 9, &[(2, 4)], Instant::now(), false, true);
         assert!(
             !outcome.retransmit.is_empty(),
             "Should trigger fast retransmit for TSN 10"
         );
 
         // Now simulate: cumulative ACK advances past the exit TSN (all acked)
-        let outcome2 = apply_sack_to_sent_queue(&mut sent, 13, &[], Instant::now(), true);
+        let outcome2 = apply_sack_to_sent_queue(&mut sent, 13, &[], Instant::now(), false, true);
         assert!(outcome2.bytes_acked_by_cum_tsn > 0);
 
         // The key verification: after processing the SACK that exits fast recovery,
@@ -5775,7 +6143,14 @@ mod tests {
 
         // Three SACKs to trigger fast retransmit (DUP_THRESH = 3)
         for i in 0..3 {
-            apply_sack_to_sent_queue(&mut sent, 19, &[(2, 2 + i as u16)], Instant::now(), true);
+            apply_sack_to_sent_queue(
+                &mut sent,
+                19,
+                &[(2, 2 + i as u16)],
+                Instant::now(),
+                false,
+                true,
+            );
         }
 
         // After fast retransmit triggers in apply_sack_to_sent_queue,
@@ -7763,6 +8138,85 @@ mod tests {
         );
     }
 
+    /// Test: configurable cwnd / slow-start cap / burst mode wiring.
+    #[tokio::test]
+    async fn test_configurable_cwnd_and_burst_modes() {
+        let (socket_tx, _) = tokio::sync::watch::channel(None);
+        let ice_conn = crate::transports::ice::conn::IceConn::new(
+            socket_tx.subscribe(),
+            "127.0.0.1:5000".parse().unwrap(),
+        );
+        let cert = crate::transports::dtls::generate_certificate().unwrap();
+        let (dtls, _, _) = DtlsTransport::new(ice_conn, cert, true, 100).await.unwrap();
+
+        // Default config: cwnd uses library default and burst limiting is disabled
+        // outside recovery.
+        let default_config = RtcConfiguration::default();
+        let (_incoming_tx, incoming_rx) = mpsc::unbounded_channel();
+        let (sctp_default, _runner) = SctpTransport::new(
+            dtls.clone(),
+            incoming_rx,
+            Arc::new(Mutex::new(Vec::new())),
+            5000,
+            5000,
+            None,
+            true,
+            &default_config,
+        );
+        assert_eq!(sctp_default.inner.cwnd_initial, CWND_INITIAL);
+        assert_eq!(
+            sctp_default.inner.cwnd_tx.load(Ordering::SeqCst),
+            CWND_INITIAL
+        );
+        assert_eq!(
+            sctp_default.inner.slow_start_increase_cap,
+            CWND_INITIAL
+        );
+        assert_eq!(sctp_default.inner.burst_limit_bytes(false), None);
+        assert_eq!(
+            sctp_default.inner.burst_limit_bytes(true),
+            Some(4 * MAX_SCTP_PACKET_SIZE)
+        );
+        assert_eq!(sctp_default.inner.gap_sack_delay_srtt_divisor, 2);
+        assert_eq!(
+            sctp_default.inner.compute_gap_sack_delay(),
+            Duration::from_millis(50)
+        );
+        assert!(!sctp_default.inner.diag_enabled);
+        assert!(!sctp_default.inner.no_sack_sig_gating);
+
+        // Custom config: explicit cwnd/cap and default burst heuristic.
+        let mut config = RtcConfiguration::default();
+        config.sctp_initial_cwnd = 24 * 1024;
+        config.sctp_slow_start_increase_cap = 12 * 1024;
+        config.sctp_unlimited_burst_non_recovery = false;
+        config.sctp_gap_sack_delay_srtt_divisor = 0;
+        config.sctp_diag_enabled = true;
+        config.sctp_no_sack_sig_gating = true;
+
+        let (_incoming_tx2, incoming_rx2) = mpsc::unbounded_channel();
+        let (sctp_custom, _runner2) = SctpTransport::new(
+            dtls.clone(),
+            incoming_rx2,
+            Arc::new(Mutex::new(Vec::new())),
+            5000,
+            5000,
+            None,
+            true,
+            &config,
+        );
+
+        assert_eq!(sctp_custom.inner.cwnd_initial, 24 * 1024);
+        assert_eq!(sctp_custom.inner.slow_start_increase_cap, 12 * 1024);
+        assert_eq!(
+            sctp_custom.inner.burst_limit_bytes(false),
+            Some(16 * MAX_SCTP_PACKET_SIZE)
+        );
+        assert_eq!(sctp_custom.inner.compute_gap_sack_delay(), Duration::ZERO);
+        assert!(sctp_custom.inner.diag_enabled);
+        assert!(sctp_custom.inner.no_sack_sig_gating);
+    }
+
     /// Test: configurable max_cwnd is correctly stored and caps cwnd growth.
     #[tokio::test]
     async fn test_configurable_max_cwnd() {
@@ -8255,7 +8709,7 @@ mod tests {
 
         // SACK with cumulative=99 (even older than lowest=100)
         // This should be filtered out as stale
-        let outcome = apply_sack_to_sent_queue(&mut sent, 99, &[], Instant::now(), true);
+        let outcome = apply_sack_to_sent_queue(&mut sent, 99, &[], Instant::now(), false, true);
 
         // All packets should still be present (stale SACK ignored)
         assert_eq!(sent.len(), 6, "Stale SACK should not modify sent queue");
@@ -8735,10 +9189,12 @@ mod tests {
         }
 
         // First SACK
-        let _ = apply_sack_to_sent_queue(&mut sent, 102, &[(3, 3)], Instant::now(), true);
+        let _ =
+            apply_sack_to_sent_queue(&mut sent, 102, &[(3, 3)], Instant::now(), false, true);
 
         // Second SACK with same signature (count_missing_reports = false)
-        let outcome2 = apply_sack_to_sent_queue(&mut sent, 102, &[(3, 3)], Instant::now(), false);
+        let outcome2 =
+            apply_sack_to_sent_queue(&mut sent, 102, &[(3, 3)], Instant::now(), false, false);
 
         // Missing reports should NOT have increased on duplicate SACK
         let rec_105 = sent.get(&105).unwrap();

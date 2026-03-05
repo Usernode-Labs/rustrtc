@@ -135,6 +135,37 @@ config.media_capabilities = Some(caps);
 let pc = PeerConnection::new(config);
 ```
 
+### SCTP (DataChannel) tuning
+
+`rustrtc` exposes a few SCTP knobs that can be useful for high-latency or
+rate-limited links (e.g., TURN relays). All values live on `RtcConfiguration`:
+
+- `sctp_max_cwnd` (bytes): upper bound for congestion window growth.
+- `sctp_max_burst` (packets): per-tick send burst limiter. `0` uses a heuristic (16 packets normal, 4 in recovery).
+- `sctp_unlimited_burst_non_recovery` (bool): when `true` and `sctp_max_burst == 0`, disables burst limiting outside recovery (avoids adding an extra RTT for payloads that already fit within `cwnd`).
+- `sctp_initial_cwnd` (bytes): initial congestion window. `0` uses the library default.
+- `sctp_slow_start_increase_cap` (bytes): caps the cwnd increase per SACK during slow start. `0` uses the effective initial cwnd.
+- `sctp_gap_sack_delay_srtt_divisor` (u32): when non-zero, delays gap SACKs by `srtt / divisor` (internally clamped). `0` disables the delay.
+- `sctp_diag_enabled` (bool): enables verbose SCTP diagnostics at `info` level (target: `rustrtc::sctp_diag`).
+- `sctp_no_sack_sig_gating` (bool): debug knob to count missing reports even on duplicate SACKs (can make loss detection more aggressive).
+
+```rust
+use rustrtc::RtcConfigurationBuilder;
+use std::time::Duration;
+
+let config = RtcConfigurationBuilder::new()
+    .sctp_max_cwnd(512 * 1024)
+    .sctp_max_burst(0)
+    .sctp_unlimited_burst_non_recovery(true)
+    .sctp_initial_cwnd(12_000)
+    .sctp_slow_start_increase_cap(12_000)
+    .sctp_gap_sack_delay_srtt_divisor(2)
+    // .sctp_diag_enabled(true) // troubleshooting
+    .sctp_rto_initial(Duration::from_millis(1200))
+    .sctp_rto_min(Duration::from_millis(600))
+    .build();
+```
+
 ## Examples
 
 You can run the examples provided in the repository.
