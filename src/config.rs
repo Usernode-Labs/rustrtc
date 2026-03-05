@@ -262,6 +262,7 @@ fn default_filter_private_host_candidates() -> bool {
 
 /// Primary configuration for a `PeerConnection`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
 pub struct RtcConfiguration {
     pub ice_servers: Vec<IceServer>,
     pub ice_transport_policy: IceTransportPolicy,
@@ -283,14 +284,56 @@ pub struct RtcConfiguration {
     /// and reduce the probability of nomination failures under packet loss.
     pub nomination_timeout: std::time::Duration,
     pub ice_connection_timeout: std::time::Duration,
+    /// Initial SCTP retransmission timeout (RTO).
     pub sctp_rto_initial: std::time::Duration,
+    /// Minimum SCTP retransmission timeout (RTO).
     pub sctp_rto_min: std::time::Duration,
+    /// Maximum SCTP retransmission timeout (RTO).
     pub sctp_rto_max: std::time::Duration,
+    /// Maximum association retransmissions before declaring the peer dead.
     pub sctp_max_association_retransmits: u32,
+    /// Local SCTP receiver window in bytes.
+    ///
+    /// Larger values allow more in-flight data (higher throughput on high-BDP
+    /// links), at the cost of memory.
     pub sctp_receive_window: usize,
+    /// SCTP heartbeat interval.
     pub sctp_heartbeat_interval: std::time::Duration,
+    /// Maximum consecutive heartbeat failures before declaring the peer dead.
     pub sctp_max_heartbeat_failures: u32,
+    /// Enable verbose SCTP diagnostics at `info` level (target: `rustrtc::sctp_diag`).
+    ///
+    /// Intended for troubleshooting; may be noisy.
+    pub sctp_diag_enabled: bool,
+    /// Disable SACK signature gating and count missing reports even on duplicate SACKs.
+    ///
+    /// Intended for troubleshooting; disabling gating can make loss detection more
+    /// aggressive.
+    pub sctp_no_sack_sig_gating: bool,
+    /// Initial SCTP congestion window (cwnd) in bytes.
+    ///
+    /// `0` uses the library default (currently IW10 ~= 10 * 1200 bytes).
+    pub sctp_initial_cwnd: usize,
+    /// Maximum cwnd increase per SACK while in slow start, in bytes.
+    ///
+    /// This caps exponential growth when the receive path coalesces ACKs.
+    /// `0` means "use the effective initial cwnd".
+    pub sctp_slow_start_increase_cap: usize,
+    /// When non-zero, delay SACKs in the presence of gaps (out-of-order data) by
+    /// `srtt / divisor` (clamped internally).
+    ///
+    /// `0` disables the gap-SACK delay (SACKs are sent immediately).
+    pub sctp_gap_sack_delay_srtt_divisor: u32,
+    /// Maximum burst size for SCTP in number of MTU-sized packets.
+    ///
+    /// `0` uses a heuristic (16 packets normal, 4 in recovery) unless
+    /// `sctp_unlimited_burst_non_recovery` is enabled.
     pub sctp_max_burst: usize,
+    /// If true and `sctp_max_burst == 0`, disable burst limiting outside of
+    /// loss recovery. This avoids adding an extra RTT for payloads that already
+    /// fit within `cwnd`.
+    pub sctp_unlimited_burst_non_recovery: bool,
+    /// Maximum congestion window size in bytes.
     pub sctp_max_cwnd: usize,
     pub dtls_buffer_size: usize,
     pub rtp_start_port: Option<u16>,
@@ -327,7 +370,13 @@ impl Default for RtcConfiguration {
             sctp_receive_window: 128 * 1024, // 128KB - reduced for lower memory footprint
             sctp_heartbeat_interval: std::time::Duration::from_secs(15),
             sctp_max_heartbeat_failures: 4,
+            sctp_diag_enabled: false,
+            sctp_no_sack_sig_gating: false,
+            sctp_initial_cwnd: 0,               // 0 = use internal default (currently IW10)
+            sctp_slow_start_increase_cap: 0,    // 0 = use effective initial cwnd
+            sctp_gap_sack_delay_srtt_divisor: 2, // 2 = srtt/2 (clamped internally)
             sctp_max_burst: 0, // 0 = use default heuristic
+            sctp_unlimited_burst_non_recovery: true,
             sctp_max_cwnd: 256 * 1024, // 256 KB
             dtls_buffer_size: 2048,
             rtp_start_port: None,
@@ -482,12 +531,53 @@ impl RtcConfigurationBuilder {
         self
     }
 
+    /// Enable verbose SCTP diagnostics at `info` level (target: `rustrtc::sctp_diag`).
+    pub fn sctp_diag_enabled(mut self, enable: bool) -> Self {
+        self.inner.sctp_diag_enabled = enable;
+        self
+    }
+
+    /// Disable SACK signature gating and count missing reports even on duplicate SACKs.
+    pub fn sctp_no_sack_sig_gating(mut self, enable: bool) -> Self {
+        self.inner.sctp_no_sack_sig_gating = enable;
+        self
+    }
+
+    /// Set the initial SCTP congestion window (cwnd) in bytes.
+    /// `0` means "use the library default".
+    pub fn sctp_initial_cwnd(mut self, bytes: usize) -> Self {
+        self.inner.sctp_initial_cwnd = bytes;
+        self
+    }
+
+    /// Set the maximum cwnd increase per SACK during slow start, in bytes.
+    /// `0` means "use the effective initial cwnd".
+    pub fn sctp_slow_start_increase_cap(mut self, bytes: usize) -> Self {
+        self.inner.sctp_slow_start_increase_cap = bytes;
+        self
+    }
+
+    /// Set the divisor for gap-SACK delay: `delay = srtt / divisor` (clamped internally).
+    /// `0` disables the gap-SACK delay (SACKs are sent immediately).
+    pub fn sctp_gap_sack_delay_srtt_divisor(mut self, divisor: u32) -> Self {
+        self.inner.sctp_gap_sack_delay_srtt_divisor = divisor;
+        self
+    }
+
     /// Set the maximum burst size for SCTP in number of MTU-sized packets.
-    /// 0 means use the default heuristic (16 packets normal, 4 in recovery).
+    /// 0 means use the default heuristic (16 packets normal, 4 in recovery),
+    /// unless `sctp_unlimited_burst_non_recovery` is enabled.
     /// For rate-limited TURN relays, a value of 2-4 can reduce burst-induced
     /// packet loss.
     pub fn sctp_max_burst(mut self, packets: usize) -> Self {
         self.inner.sctp_max_burst = packets;
+        self
+    }
+
+    /// If true and `sctp_max_burst == 0`, disable burst limiting outside of
+    /// loss recovery.
+    pub fn sctp_unlimited_burst_non_recovery(mut self, enable: bool) -> Self {
+        self.inner.sctp_unlimited_burst_non_recovery = enable;
         self
     }
 
@@ -529,7 +619,13 @@ mod tests {
         assert_eq!(config.sctp_max_association_retransmits, 20);
         assert_eq!(config.sctp_heartbeat_interval, Duration::from_secs(15));
         assert_eq!(config.sctp_max_heartbeat_failures, 4);
+        assert!(!config.sctp_diag_enabled);
+        assert!(!config.sctp_no_sack_sig_gating);
+        assert_eq!(config.sctp_initial_cwnd, 0);
+        assert_eq!(config.sctp_slow_start_increase_cap, 0);
+        assert_eq!(config.sctp_gap_sack_delay_srtt_divisor, 2);
         assert_eq!(config.sctp_max_burst, 0);
+        assert!(config.sctp_unlimited_burst_non_recovery);
         assert_eq!(config.sctp_max_cwnd, 256 * 1024);
     }
 
@@ -553,7 +649,13 @@ mod tests {
             .sctp_receive_window(512 * 1024)
             .sctp_heartbeat_interval(Duration::from_secs(10))
             .sctp_max_heartbeat_failures(8)
+            .sctp_diag_enabled(true)
+            .sctp_no_sack_sig_gating(true)
+            .sctp_initial_cwnd(24 * 1024)
+            .sctp_slow_start_increase_cap(12 * 1024)
+            .sctp_gap_sack_delay_srtt_divisor(4)
             .sctp_max_burst(4)
+            .sctp_unlimited_burst_non_recovery(false)
             .sctp_max_cwnd(512 * 1024)
             .ice_connection_timeout(Duration::from_secs(60))
             .build();
@@ -565,7 +667,13 @@ mod tests {
         assert_eq!(config.sctp_receive_window, 512 * 1024);
         assert_eq!(config.sctp_heartbeat_interval, Duration::from_secs(10));
         assert_eq!(config.sctp_max_heartbeat_failures, 8);
+        assert!(config.sctp_diag_enabled);
+        assert!(config.sctp_no_sack_sig_gating);
+        assert_eq!(config.sctp_initial_cwnd, 24 * 1024);
+        assert_eq!(config.sctp_slow_start_increase_cap, 12 * 1024);
+        assert_eq!(config.sctp_gap_sack_delay_srtt_divisor, 4);
         assert_eq!(config.sctp_max_burst, 4);
+        assert!(!config.sctp_unlimited_burst_non_recovery);
         assert_eq!(config.sctp_max_cwnd, 512 * 1024);
         assert_eq!(config.ice_connection_timeout, Duration::from_secs(60));
     }
