@@ -70,6 +70,7 @@ pub enum StunClass {
 pub enum StunMethod {
     Binding,
     Allocate,
+    Refresh,
     CreatePermission,
     ChannelBind,
     Send,
@@ -103,6 +104,8 @@ pub struct StunDecoded {
     pub xor_relayed_address: Option<SocketAddr>,
     pub xor_peer_address: Option<SocketAddr>,
     pub error_code: Option<u16>,
+    pub ice_controlling: Option<u64>,
+    pub ice_controlled: Option<u64>,
     pub realm: Option<String>,
     pub nonce: Option<String>,
     pub data: Option<Vec<u8>>,
@@ -118,6 +121,7 @@ fn encode_stun_message(
     let method_bits = match msg.method {
         StunMethod::Binding => 0x0001,
         StunMethod::Allocate => 0x0003,
+        StunMethod::Refresh => 0x0004,
         StunMethod::CreatePermission => 0x0008,
         StunMethod::ChannelBind => 0x0009,
         StunMethod::Send => 0x0006,
@@ -296,6 +300,7 @@ fn decode_stun_message(bytes: &[u8]) -> Result<StunDecoded> {
     let method = match msg_type & 0x3EEF {
         0x0001 => StunMethod::Binding,
         0x0003 => StunMethod::Allocate,
+        0x0004 => StunMethod::Refresh,
         0x0008 => StunMethod::CreatePermission,
         0x0009 => StunMethod::ChannelBind,
         0x0006 => StunMethod::Send,
@@ -316,6 +321,8 @@ fn decode_stun_message(bytes: &[u8]) -> Result<StunDecoded> {
     let mut xor_relayed_address = None;
     let mut xor_peer_address = None;
     let mut error_code = None;
+    let mut ice_controlling = None;
+    let mut ice_controlled = None;
     let mut realm = None;
     let mut nonce = None;
     let mut data = None;
@@ -350,6 +357,20 @@ fn decode_stun_message(bytes: &[u8]) -> Result<StunDecoded> {
                     error_code = Some(code);
                 }
             }
+            0x802A => {
+                if value.len() >= 8 {
+                    let mut buf = [0u8; 8];
+                    buf.copy_from_slice(&value[..8]);
+                    ice_controlling = Some(u64::from_be_bytes(buf));
+                }
+            }
+            0x8029 => {
+                if value.len() >= 8 {
+                    let mut buf = [0u8; 8];
+                    buf.copy_from_slice(&value[..8]);
+                    ice_controlled = Some(u64::from_be_bytes(buf));
+                }
+            }
             0x0014 => {
                 if let Ok(text) = std::str::from_utf8(value) {
                     realm = Some(text.to_string());
@@ -379,6 +400,8 @@ fn decode_stun_message(bytes: &[u8]) -> Result<StunDecoded> {
         xor_relayed_address,
         xor_peer_address,
         error_code,
+        ice_controlling,
+        ice_controlled,
         realm,
         nonce,
         data,
@@ -477,5 +500,28 @@ mod tests {
             0x90, 0x70, 0x1c, 0x9d, 0xb4, 0xd9,
         ];
         assert_eq!(hmac_sha1(key, data), expected);
+    }
+
+    #[test]
+    fn test_decode_ice_controlling_and_controlled() -> Result<()> {
+        let tx_id = [0xAB; 12];
+
+        let controlling = 0x1122_3344_5566_7788u64;
+        let mut msg = StunMessage::binding_request(tx_id, Some("test"));
+        msg.attributes.push(StunAttribute::IceControlling(controlling));
+        let bytes = msg.encode(None, false)?;
+        let decoded = StunMessage::decode(&bytes)?;
+        assert_eq!(decoded.ice_controlling, Some(controlling));
+        assert_eq!(decoded.ice_controlled, None);
+
+        let controlled = 0x0123_4567_89AB_CDEFu64;
+        let mut msg = StunMessage::binding_request(tx_id, Some("test"));
+        msg.attributes.push(StunAttribute::IceControlled(controlled));
+        let bytes = msg.encode(None, false)?;
+        let decoded = StunMessage::decode(&bytes)?;
+        assert_eq!(decoded.ice_controlled, Some(controlled));
+        assert_eq!(decoded.ice_controlling, None);
+
+        Ok(())
     }
 }
